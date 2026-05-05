@@ -101,4 +101,4 @@ python main.py
 
 ## 📝 许可证
 
-MIT License
+MIT开源许可证
