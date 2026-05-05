@@ -21,7 +21,7 @@ BASE_DIR = Path(__file__).parent
 TOOLS_DIR = BASE_DIR / "tools"
 WORKSPACE = BASE_DIR / "workspace"
 CHECKPOINT_FILE = WORKSPACE / "checkpoint.json"
-VERSION = "2.0"
+VERSION = "1.0"
 
 # ★ 优化: 中间帧用 JPG 质量95 (体积仅PNG的1/10, 视觉无损)
 # 注意: Real-ESRGAN 和 RIFE 都支持 JPG 输入输出
