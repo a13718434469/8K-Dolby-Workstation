@@ -40,52 +40,55 @@
 - **Python:** 3.8+（推荐 Anaconda）
 - **GPU:** NVIDIA（建议 8GB+ 显存）
 
-### 安装
+### 一键安装
 
 ```bash
 # 1. 克隆仓库
 git clone https://github.com/a13718434469/8K-Dolby-Workstation.git
 cd 8K-Dolby-Workstation
 
-# 2. 安装依赖
-pip install PyQt5
-
-# 3. 下载工具
+# 2. 双击 setup.bat — 自动下载所有工具 + 安装依赖
 ```
 
-将以下工具放入 `tools/` 目录：
+`setup.bat` 会自动下载：
+- ✅ FFmpeg（视频处理核心）
+- ✅ Real-ESRGAN（AI 超分引擎 + 模型）
+- ✅ RIFE（AI 插帧引擎 + v4.6 模型）
+- ✅ dovi_tool（杜比 RPU 注入）
+- ✅ PyQt5（Python 依赖）
 
-| 工具 | 说明 | 获取方式 |
-|------|------|----------|
-| `ffmpeg.exe` + `ffprobe.exe` | 视频处理核心 | [FFmpeg官网](https://ffmpeg.org/download.html) |
-| `realesrgan-ncnn-vulkan.exe` | AI超分引擎 | [Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) |
-| `rife-ncnn-vulkan.exe` | AI插帧引擎 | [RIFE-ncnn-Vulkan](https://github.com/nihui/rife-ncnn-vulkan) |
-| `rife-v4.6/` | RIFE模型 | 同上 |
-| `dovi_tool.exe` | 杜比RPU注入 | [dovi_tool](https://github.com/quietvoid/dovi_tool) |
+### 手动安装
+
+如果自动下载速度慢，也可以手动下载工具放入 `tools/` 目录：
+
+```
+tools/
+├── ffmpeg.exe + ffprobe.exe     # https://ffmpeg.org
+├── realesrgan-ncnn-vulkan.exe   # Real-ESRGAN
+├── rife-ncnn-vulkan.exe         # RIFE 引擎
+├── rife-v4.6/flownet.bin        # RIFE 模型
+└── dovi_tool.exe                # dovi_tool
+```
 
 ### 启动
 
 ```bash
+# 方式一：双击 run.bat（自动检测环境）
+# 方式二：
 python main.py
-# 或双击 run.bat
 ```
 
 ## 📁 项目结构
 
 ```
 8K-Dolby-Workstation/
-├── main.py          # 主程序（PyQt5界面）
-├── run.bat          # 启动脚本
-├── setup.ps1        # 环境配置脚本
-├── requirements.txt # Python依赖
-├── tools/           # 第三方工具（需手动下载）
-│   ├── ffmpeg.exe
-│   ├── ffprobe.exe
-│   ├── realesrgan-ncnn-vulkan.exe
-│   ├── rife-ncnn-vulkan.exe
-│   ├── rife-v4.6/
-│   └── dovi_tool.exe
-└── workspace/       # 工作目录（自动创建）
+├── main.py              # 主程序（PyQt5 界面）
+├── run.bat              # 启动脚本（自动检测环境）
+├── setup.bat            # 一键安装脚本（下载工具+依赖）
+├── setup.ps1            # PowerShell 安装脚本
+├── requirements.txt     # Python 依赖
+├── tools/               # 第三方工具（自动下载）
+└── workspace/           # 工作目录（自动创建）
 ```
 
 ## ⚙️ 性能参考
@@ -99,6 +102,4 @@ python main.py
 
 > 实际耗时受视频内容复杂度影响，以上为估算值。
 
-## 📝 许可证
-
-MIT开源许可证
+## 📝 MIT 开源许可证
