@@ -54,7 +54,8 @@ HAS_NATIVE_DOVI = bool(
 class MediaPipelineTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="dolby-regression-")
-        self.root = Path(self.temp.name)
+        # Windows TEMP can use an 8.3 alias; compare canonical paths throughout.
+        self.root = Path(self.temp.name).resolve()
         self.source = self.root / "source with spaces.mp4"
         self.output = self.root / "result with spaces.mp4"
         command([
