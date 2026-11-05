@@ -1,8 +1,8 @@
-# 8K Dolby Workstation 2.2
+# 8K Dolby Workstation 2.3
 
 用于视频检查、原片保留、高精度转码和可选 AI 增强的本地工作站。桌面与命令行共用处理核心，输出经过解码和格式检查后才保存为正式文件。
 
-本版将 **B站 Dolby Vision 8.4 交付**、**常规高质量导出**和 **AI 增强**分开，默认优先保留原片。已有 Dolby Vision / Atmos 素材可检查后保留码流；需要重新制作时，使用明确的色彩与配套元数据流程。
+桌面默认制作 **B站 Dolby Vision 8.4 候选成片**：已有合规原片保留码流，其他素材自动完成 HLG 画面处理、最终画面逐帧分析、动态元数据生成与封装。普通 SDR 的高光扩展采用独立、保色相的连续曲线；已有 HDR 不重复扩展。现成 E-AC-3 JOC / Atmos 音轨优先保留。常规导出、原片保留和 AI 增强仍可手动选择；命令行旧默认仍为原片保留。
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
@@ -12,9 +12,9 @@
 
 | 界面方案 | 路线 | 适用素材与行为 |
 | --- | --- | --- |
-| 保持原画质（推荐） | `preserve` | 可直接封装为 MP4 的普通视频；保持视频码流，自带音轨直接使用，也可单独替换音频 |
+| 保持原画质 | `preserve` | 可直接封装为 MP4 的普通视频；保持视频码流，自带音轨直接使用，也可单独替换音频 |
 | B站杜比 · 保留原片 | `preserve` | 已有合规 Dolby Vision 8.4 素材；保留视频编码、尺寸、帧率、位深和杜比数据，封装为 MP4。已有 E-AC-3 JOC / Atmos 可原码流复制 |
-| B站杜比 · HLG / 8.4 制作 | `transcode` | 从 SDR / HDR 素材制作 HLG 基础层，注入针对最终画面及时序制作的 **8.4 RPU**；需要成片质检 |
+| B站杜比 · HLG / 8.4 制作 | `transcode` | 默认从 SDR / HDR 素材制作 HLG 基础层，分析每个最终编码帧后生成 **8.4 RPU**；也可手动提供配套 RPU |
 | 高质量常规导出 | `transcode` | 以源精度解码，按目标进行高精度色彩处理，最终编码为 10-bit HEVC；默认沿用源尺寸、帧率和 SDR / PQ / HLG 类型 |
 | AI 增强 · 插帧与超分 | `enhance` | 按需使用 RIFE 插帧、Real-ESRGAN x4 超分和分批编码；面向 SDR，使用 8-bit RGB 工作帧 |
 
@@ -37,11 +37,11 @@
 git clone https://github.com/a13718434469/8K-Dolby-Workstation.git
 cd 8K-Dolby-Workstation
 
-# 基础环境与 FFmpeg：可先使用保留原片 / 常规转码
+# 基础环境、FFmpeg、dovi_tool：支持 CPU 自动杜比制作
 .\setup.bat -CoreOnly
 .\run.bat
 
-# 完整 AI 环境和可选 dovi_tool
+# 另装完整 AI 环境；-WithDovi 保留为兼容旧命令的选项
 .\setup.bat -WithDovi
 
 # 仅检查安装；或在已手动放好工具时仅装依赖并检查
@@ -62,12 +62,12 @@ cd 8K-Dolby-Workstation
 1. 把视频拖到窗口，或点击“添加文件”。整段视频直接使用原音；也可同时拖入一个视频与一个音频，或者先后添加。
 2. 程序异步识别素材，自动选择兼容的处理方式，并在源文件旁生成不覆盖原文件的输出名。主界面显示画面、音轨和保存位置摘要，普通素材无需配置参数。
 3. 点击“开始处理”。如需替换音轨，将音频拖到音轨区域；该区域也可从另一视频容器读取音轨。“使用原音”可随时撤销替换。
-4. 需要修改输出尺寸、色彩、AI 或杜比制作参数时再展开“调整设置”。重新制作杜比视界仍需要与成片配套的 RPU，不会靠改标签伪造杜比。
+4. 需要修改输出尺寸、色彩、AI 或杜比制作参数时再展开“调整设置”。8.4 默认自动生成逐帧元数据，无需手动寻找 RPU；8.1 仍需提供外部配套 RPU。若素材的实际帧仍缺少动态范围信息且带有 BT.2020 信号，先选择源动态范围（SDR / HLG / PQ）再开始。
 5. 完成后打开输出目录，按需查看本地质检结果。
 
 桌面默认正常最大化，保留系统标题栏和任务栏；使用标准窗口按钮可还原大小。界面使用较大字体与按钮，并适配高 DPI。高级参数、质检详情和日志默认收起，滚动不会意外改变下拉选项。
 
-智能默认会优先复制 MP4 兼容的视频编码；其他编码使用原生高精度转码，保持源尺寸、帧率与色彩，不自动开启 AI。WAV、FLAC 等不能直接复制的音轨自动转为 AAC；已有受支持的 E-AC-3 / Atmos 则优先复制。改为 AAC 或静音时，界面明确提示不会保留 Atmos。一次只处理一个视频，多视频或无效文件会明确提示且保留当前输入。导入检查期间界面保持响应，开始处理后锁定素材，避免混用。
+智能默认会保留已经合规的 8.4 原片；其他普通 SDR / HLG / PQ 素材使用 CPU 高精度自动制作，输出沿用源尺寸与帧率并保守限制在 4K / 60fps，不自动开启 AI。WAV、FLAC 等不能直接复制的音轨自动转为 AAC；已有受支持的 E-AC-3 / Atmos 则优先复制。改为 AAC 或静音时，界面明确提示不会保留 Atmos。一次只处理一个视频，多视频或无效文件会明确提示且保留当前输入。导入检查期间界面保持响应，开始处理后锁定素材，避免混用。
 
 应用图标由 `assets/app.svg` 和 `app_identity.py` 提供，多尺寸本地渲染，无网络素材依赖。程序从实际 PyQt5 包位置设置插件目录，支持含中文的安装路径。
 
@@ -81,6 +81,16 @@ cd 8K-Dolby-Workstation
 
 **杜比重新制作**中，8.1 使用 PQ 基础层，8.4 使用 HLG 基础层。外部 RPU 必须对应最终画面的色彩、裁切、尺寸、镜头及时序，帧数须完全匹配。改变画面或帧率后不应直接沿用源 RPU；静态模板元数据不等于专业动态调色分析。
 
+### 自动 HDR 重制与动态元数据
+
+自动 8.4 流程只编码一次 HLG 基础层，再分析**最终编码后的每一帧**，因此元数据对应最终尺寸、帧率与画面。SDR 先转为浮点线性 BT.2020，采用整片固定、连续且保持 RGB 比例的高光扩展曲线（默认峰值目标 600nits，可设 100–1000）；HDR 源仅进行需要的色彩转换，不重复 SDR 扩展。该处理不会恢复源片已经剪掉的高光细节。Profile 5 的专用 IPT 色彩转换不在此 CPU 路线内，应先输出正确 HLG / PQ 母版；原码流保留不受影响。
+
+分析器使用 NumPy 在 CPU 上流式处理原生 4:2:0 像素，从已安装 dovi_tool 取得实际 Profile 8.4 composer，按同一映射重建 PQ RGB，再测量逐帧 min / max / avg 并生成 L1。不会把通用 HLG 亮度统计直接套入另一套 RPU 映射。原始测量值与 CM4 合法范围夹限后的实写值同时保存；封装后再次提取全部 RPU，逐帧核对 L1 与数量。
+
+这是**依据公开规范实现的独立分析**，不宣称等同 Dolby 原厂专有算法、长时窗分析、人工调色或平台认证。空间降采样、色度插值与暗场夹限的具体选择见 [分析方法与开源声明](DOLBY_ANALYSIS_NOTICE.md)。没有自动生成 Atmos 对象混音；双标音频仍需提供真实 E-AC-3 JOC。
+
+每帧解码与分析需要额外 CPU 时间；像素按帧和小块处理，不把整片展开成 RGB 文件。dovi_tool 会载入完整元数据列表，其内存用量随片长增长，长片仍须留出足够内存。最终核验覆盖全部帧 L1、帧数及首帧 composer，报告分别注明范围。默认清理媒体中间件，但保留任务目录 `auto-dolby/` 中的逐帧统计、RPU 和方法报告，便于复核。缓存绑定基础层与 RPU 哈希；损坏或改变时拒绝沿用。
+
 x265 默认 CRF 为 18，数值更低通常产生更大文件。较慢预设可能以更多时间提高压缩效率。空间和耗时估算只作参考，不保证画质、精确文件大小或完成时间。
 
 ## 命令行
@@ -88,6 +98,12 @@ x265 默认 CRF 为 18，数值更低通常产生更大文件。较慢预设可�
 命令行不启动 GUI，与桌面共用核心。默认保留原视频与音轨，沿用源尺寸、帧率和色彩，AI / 插帧默认关闭。手机旋转素材在原生转码时按显示方向确定默认宽高，原片保留则保留编码尺寸与旋转信息：
 
 ```powershell
+# 普通素材自动制作；合规8.4原片自动保留
+.\.venv\Scripts\python.exe cli.py -i "source.mp4" -o "automatic_dv84.mp4" --auto-dolby
+
+# 同时配入已有真实Atmos音轨，并要求最终保留
+.\.venv\Scripts\python.exe cli.py -i "source.mp4" -o "automatic_dual.mp4" --auto-dolby --audio "matched_atmos.eac3" --require-atmos
+
 # 已有 B站 8.4 素材：原码流交付与本地检查
 .\.venv\Scripts\python.exe cli.py -i "source_dv84.mp4" -o "delivery.mp4" --route preserve --delivery bilibili
 
@@ -122,6 +138,10 @@ x265 默认 CRF 为 18，数值更低通常产生更大文件。较慢预设可�
 | `--no-ai` / `--no-interp` | 兼容旧命令的关闭选项 |
 | `--work-size WIDTHxHEIGHT` / `--model` | AI 工作尺寸 / 模型 |
 | `--rpu` | 与最终画面及时序匹配的 RPU |
+| `--auto-dolby` | 自动选择合规 8.4 原片保留或 4K60 范围内的 8.4 制作 |
+| `--rpu-mode auto\|external` | 8.4 自动逐帧分析 / 手动配套 RPU；指定 `--rpu` 默认使用外部模式 |
+| `--hdr-remaster auto\|off` / `--hdr-peak-nits` | SDR 高光扩展开关与 100–1000nits 峰值目标，HDR 源不重复扩展 |
+| `--source-transfer auto\|bt709\|arib-std-b67\|smpte2084` | 自动识别或明确源素材的 SDR / HLG / PQ 解释 |
 | `--audio` / `--audio-mode copy\|aac\|eac3\|none` | 外部音频 / 音轨处理方式 |
 | `--require-atmos` | 要求已有 Atmos 证据并保留，不生成 Atmos |
 | `--preset` / `--crf` | x265 速度与质量 |
@@ -150,6 +170,7 @@ B站交付封装时移除容器附加元数据和章节。本地报告可能含�
 - 保留原片的视频负载 SHA256、杜比配置与色彩一致性。
 - B站路线的 HLG / Profile 8.4、基础层 / RPU / 单层声明和 4:2:0 10-bit。
 - Atmos 编码证据；可选 MediaInfo 补充 JOC 检测，未安装不会自动下载。
+- 自动制作的基础层哈希、实际测量/实写 L1、RPU 哈希、封装后的逐帧元数据一致性，以及实际执行的 HDR 重制方式。
 
 技术检查不能自动评判所有 AI 伪影、镜头调色或 RPU 视觉匹配，也不替代真实播放器与平台转码。先用短片检查暗部、高光、色阶、运动边缘、音画同步及支持设备上的 HDR / Atmos 回放，再处理完整作品。
 
@@ -180,10 +201,10 @@ workspace/
 
 程序优先查找 `tools/`，随后查找 `PATH`，AI 模型仍需放在项目目录。自动安装器仅支持 Windows；Linux / macOS 可手动安装相应平台程序与 Python 依赖，使用 CLI。跨平台测试不代表所有桌面环境或驱动都已验收。
 
-- [FFmpeg](https://ffmpeg.org/download.html) / [BtbN Windows builds](https://github.com/BtbN/FFmpeg-Builds/releases)：使用完整新版，需 ffmpeg / ffprobe、libx265、AAC、E-AC-3、`zscale`。重新注入 DV 还需支持 `compression=0` 的 `dovi_rpu` 与 `setts`。
+- [FFmpeg](https://ffmpeg.org/download.html) / [BtbN Windows builds](https://github.com/BtbN/FFmpeg-Builds/releases)：使用完整新版，需 ffmpeg / ffprobe、libx265、AAC、E-AC-3、`zscale` 和 `lut3d`。重新注入 DV 还需支持 `compression=0` 的 `dovi_rpu` 与 `setts`。
 - [Real-ESRGAN Windows v0.2.5.0](https://github.com/xinntao/Real-ESRGAN/releases/tag/v0.2.5.0)：程序与 `models/`。
 - [RIFE ncnn Vulkan 20221029](https://github.com/nihui/rife-ncnn-vulkan/releases/tag/20221029)：程序与 `rife-v4.6/`。
-- [dovi_tool 2.3.4](https://github.com/quietvoid/dovi_tool/releases/tag/2.3.4)：重新注入 RPU 时需要，保留原片不必重生成 RPU。
+- [dovi_tool 2.3.4](https://github.com/quietvoid/dovi_tool/releases/tag/2.3.4)：基础安装包含，自动生成/注入 RPU 时需要，保留原片不必重生成 RPU。
 - [MediaInfo](https://mediaarea.net/en/MediaInfo)：可选命令行工具，补充 JOC / Atmos 证据。
 
 ```text
@@ -196,7 +217,7 @@ tools/
 │   └── realesr-animevideov3-x4.bin / .param
 ├── rife-ncnn-vulkan.exe
 ├── rife-v4.6/flownet.bin / flownet.param
-├── dovi_tool.exe             # 可选
+├── dovi_tool.exe             # 自动杜比制作必需
 └── mediainfo.exe             # 可选
 ```
 

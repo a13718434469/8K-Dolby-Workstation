@@ -21,7 +21,7 @@ from pipeline import (
     find_rife_model, find_tool, load_checkpoint, probe_video,
 )
 
-VERSION = "2.2"
+VERSION = "2.3"
 
 
 def ai_tools_available():
@@ -254,9 +254,9 @@ class ProcessThread(QThread):
 
 class MainWindow(QMainWindow):
     PRESETS = {
-        "preserve": ("保持原画质（推荐）", "不重编码视频，保持原始分辨率、帧率和色彩。"),
+        "preserve": ("原片保留（不重新编码）", "不重编码视频，保持原始分辨率、帧率和色彩。"),
         "bili_preserve": ("B站杜比 · 保留原片", "保留已有 Dolby Vision 8.4 与原始码流。优先保障画质，有现成 Atmos 就原样保留。"),
-        "bili_make": ("B站杜比 · HLG / 8.4 制作", "输出 HLG / Dolby Vision 8.4。需要与最终画面、时序匹配的 8.4 RPU；导出后生成本地质检报告。"),
+        "bili_make": ("B站杜比 · 自动制作（推荐）", "自动制作 HLG / Dolby Vision 8.4，逐帧分析最终画面生成杜比元数据。普通 SDR 自动扩展 HDR 亮度，已有 HDR 不二次扩展；平台识别仍需转码验收。"),
         "quality": ("高质量常规导出", "原生精度处理，默认保留源分辨率和帧率。适合 SDR、HDR10 与 HLG 内容制作。"),
         "enhance": ("AI 增强 · 插帧与超分", "按需启用 AI。此路径使用 8-bit SDR RGB 工作帧；HDR 母版推荐选择原片保留或高质量导出。"),
     }
@@ -295,6 +295,7 @@ class MainWindow(QMainWindow):
         self._setting_audio_mode = False
         self._preserve_restored_settings = False
         self._smart_native_conversion = False
+        self._hdr_peak_nits = 600
         self.settings_file = WORKSPACE / "ui_preferences.json"
         self.sr_available, self.interp_available = ai_tools_available()
         self.setStyleSheet(self.stylesheet())
@@ -516,26 +517,46 @@ class MainWindow(QMainWindow):
         self.work_size.addItem("720p 工作尺寸", (1280, 720))
         self.rpu = FileField("选择与成片匹配的 RPU.bin", "RPU 元数据 (*.bin);;所有文件 (*)")
         self.rpu.files_selected.connect(lambda paths: self.import_files(paths, "auto"))
-        self.rpu_label = QLabel("杜比元数据")
+        self.rpu_label = QLabel("配套 RPU 文件")
+        self.rpu_mode = SafeComboBox()
+        self.rpu_mode.addItem("自动逐帧分析 8.4（推荐）", "auto")
+        self.rpu_mode.addItem("使用配套 RPU 文件", "external")
+        self.rpu_mode_label = QLabel("杜比元数据")
+        self.hdr_remaster = SafeComboBox()
+        self.hdr_remaster.addItem("智能 HDR 亮度扩展", "auto")
+        self.hdr_remaster.addItem("关闭亮度扩展", "off")
+        self.hdr_remaster.setToolTip("普通 SDR 自动扩展 HDR 亮度；已有 HDR 原片不会重复扩展。")
+        self.hdr_remaster_label = QLabel("HDR 处理")
+        self.source_transfer = SafeComboBox()
+        for label, value in [("自动识别（推荐）", "auto"), ("SDR · BT.709", "bt709"),
+                             ("HDR · HLG", "arib-std-b67"), ("HDR · PQ / HDR10", "smpte2084")]:
+            self.source_transfer.addItem(label, value)
+        self.source_transfer.setToolTip("只在源文件动态范围标记缺失或不正确时手动指定。原片保留不改变源解释。")
         self.clean = QCheckBox("自动清理临时文件")
         self.clean.setChecked(True)
         advanced.addWidget(QLabel("画面格式"), 0, 0)
         advanced.addWidget(self.color, 0, 1)
         advanced.addWidget(QLabel("音频编码"), 0, 2)
         advanced.addWidget(self.audio_mode, 0, 3)
-        advanced.addWidget(QLabel("编码速度"), 1, 0)
-        advanced.addWidget(self.encoding_preset, 1, 1)
-        advanced.addWidget(QLabel("画质 CRF"), 1, 2)
-        advanced.addWidget(self.crf, 1, 3)
-        advanced.addWidget(self.ai, 2, 0)
-        advanced.addWidget(self.model, 2, 1)
-        advanced.addWidget(self.interp, 2, 2)
-        advanced.addWidget(self.work_size, 2, 3)
-        advanced.addWidget(QLabel("每批帧数"), 3, 0)
-        advanced.addWidget(self.batch_size, 3, 1)
-        advanced.addWidget(self.clean, 3, 2, 1, 2)
-        advanced.addWidget(self.rpu_label, 4, 0)
-        advanced.addWidget(self.rpu, 4, 1, 1, 3)
+        advanced.addWidget(QLabel("源动态范围"), 1, 0)
+        advanced.addWidget(self.source_transfer, 1, 1)
+        advanced.addWidget(self.hdr_remaster_label, 1, 2)
+        advanced.addWidget(self.hdr_remaster, 1, 3)
+        advanced.addWidget(self.rpu_mode_label, 2, 0)
+        advanced.addWidget(self.rpu_mode, 2, 1)
+        advanced.addWidget(self.rpu_label, 3, 0)
+        advanced.addWidget(self.rpu, 3, 1, 1, 3)
+        advanced.addWidget(QLabel("编码速度"), 4, 0)
+        advanced.addWidget(self.encoding_preset, 4, 1)
+        advanced.addWidget(QLabel("画质 CRF"), 4, 2)
+        advanced.addWidget(self.crf, 4, 3)
+        advanced.addWidget(self.ai, 5, 0)
+        advanced.addWidget(self.model, 5, 1)
+        advanced.addWidget(self.interp, 5, 2)
+        advanced.addWidget(self.work_size, 5, 3)
+        advanced.addWidget(QLabel("每批帧数"), 6, 0)
+        advanced.addWidget(self.batch_size, 6, 1)
+        advanced.addWidget(self.clean, 6, 2, 1, 2)
         tool_row = QHBoxLayout()
         tool_row.addWidget(self.tool_label)
         tool_row.addStretch()
@@ -636,11 +657,14 @@ class MainWindow(QMainWindow):
         self.advanced_toggle.toggled.connect(self.toggle_advanced)
         self.quality_toggle.toggled.connect(self.toggle_quality)
         self.log_toggle.toggled.connect(self.toggle_log)
-        for combo in (self.model, self.resolution, self.fps, self.color, self.audio_mode):
+        for combo in (self.model, self.resolution, self.fps, self.color, self.audio_mode, self.rpu_mode, self.hdr_remaster, self.source_transfer):
             combo.currentIndexChanged.connect(self.update_estimates)
             combo.currentIndexChanged.connect(self.update_automatic_summary)
         self.resolution.currentIndexChanged.connect(self.refresh_start_state)
-        self.color.currentIndexChanged.connect(self.update_control_states)
+        self.source_transfer.currentIndexChanged.connect(self.refresh_start_state)
+        self.color.currentIndexChanged.connect(self.color_selected)
+        self.rpu_mode.currentIndexChanged.connect(self.update_control_states)
+        self.rpu.changed.connect(self.rpu_selected)
         self.audio_mode.currentIndexChanged.connect(self.audio_mode_selected)
         self.ai.toggled.connect(self.update_control_states)
         self.interp.toggled.connect(self.update_control_states)
@@ -652,7 +676,7 @@ class MainWindow(QMainWindow):
         self.load_preferences()
         # Import defaults are determined from each source, not a prior project.
         self._choosing_automatic = True
-        self.select_data(self.export_preset, "preserve")
+        self.select_data(self.export_preset, "bili_make")
         self._choosing_automatic = False
         self.apply_preset()
         self.advanced_toggle.setChecked(False)
@@ -846,6 +870,11 @@ class MainWindow(QMainWindow):
                     self._preset_explicit = False
                     self._preserve_restored_settings = False
                     self._audio_mode_explicit = False
+                    self.rpu.set_file("")
+                    self.select_data(self.rpu_mode, "auto")
+                    self.select_data(self.hdr_remaster, "auto")
+                    self.select_data(self.source_transfer, "auto")
+                    self._hdr_peak_nits = 600
                 if old_video and different and audio is None:
                     self.ainfo = None
                     self.audio.set_file("")
@@ -872,6 +901,8 @@ class MainWindow(QMainWindow):
             message = "音频已添加，请继续拖入视频。"
         if self.output_size_needs_attention():
             message = "这个视频的尺寸太小，兼容转码需至少 64 × 48。请在“调整设置”中选择输出尺寸，当前不会开始编码。"
+        elif self.source_transfer_needs_attention():
+            message = "源文件带有 BT.2020 色彩信息，但缺少动态范围标记。请在“调整设置 → 源动态范围”中明确选择 SDR、HLG 或 PQ，避免错误处理亮度。"
         self.notify(message)
         self.refresh_start_state()
         self.refresh_resume()
@@ -932,17 +963,36 @@ class MainWindow(QMainWindow):
             self.automatic_summary.setText("音频已添加，继续添加视频即可。" if self.audio.filepath else "添加视频后自动检查格式。\n通常无需调整设置，直接开始处理。")
             return
         route = self.current_route()
+        making_dolby = route != "preserve" and self.color.currentData() in ("dv81", "dv84")
         picture = "画面保持原样" if route == "preserve" else "画面按所选设置处理"
+        if making_dolby:
+            profile = "8.4" if self.color.currentData() == "dv84" else "8.1"
+            picture = f"将制作杜比视界 {profile}"
+            if self.rpu_mode.currentData() == "auto":
+                picture += "\n8.1 需要配套 RPU；自动分析仅支持 8.4" if profile == "8.1" else "\n自动分析画面，生成杜比元数据"
+            else:
+                picture += "\n使用配套 RPU 元数据"
+            if self.hdr_remaster.currentData() == "auto":
+                source_transfer = self.source_transfer.currentData()
+                if source_transfer == "auto":
+                    source_transfer = self.vinfo.get("color_transfer")
+                hdr_source = source_transfer in ("arib-std-b67", "smpte2084")
+                if not self.source_transfer_needs_attention():
+                    picture += "\n保留原片 HDR 亮度，不重复扩展" if hdr_source else "\n智能扩展 SDR 亮度，制作 HDR 画面"
+            cfg = self.config()
+            picture += f"\n{cfg['width']} × {cfg['height']} · {cfg.get('fps_override') or cfg['target_fps']} fps"
         if self._smart_native_conversion and route == "transcode":
             source_color = {"arib-std-b67": "hlg", "smpte2084": "hdr10"}.get(self.vinfo.get("color_transfer"), "sdr")
             unchanged = tuple(self.resolution.currentData()) == (0, 0) and not self.fps.currentData() and self.color.currentData() == source_color
             picture = "自动转为兼容 MP4\n" + ("保持源尺寸、帧率和色彩设置" if unchanged else "画面按所选设置处理")
         if self.output_size_needs_attention():
             picture += "\n原片尺寸过小，请在“调整设置”中选择更大尺寸"
+        if self.source_transfer_needs_attention():
+            picture += "\n源动态范围标记缺失\n请在“调整设置”中明确源动态范围"
         source_dv = self.vinfo.get("dv_profile")
         if source_dv and route != "preserve":
-            if self.color.currentData() in ("dv81", "dv84"):
-                picture += "\n仅使用原片基础层；原杜比元数据不保留，将按配套 RPU 重新制作"
+            if making_dolby:
+                picture += "\n基于原片基础层重新制作杜比元数据"
             else:
                 picture += "\n仅处理基础层，不保留原杜比标签"
         mode = self.audio_mode.currentData()
@@ -954,6 +1004,12 @@ class MainWindow(QMainWindow):
             sound = "原片无音轨，可直接处理或另加音频"
         else:
             sound = "使用原音"
+        audio_info = self.ainfo if self.audio.filepath else self.vinfo
+        if making_dolby or self.export_preset.currentData() == "bili_preserve":
+            if mode == "copy" and (audio_info or {}).get("atmos") == "confirmed" and (audio_info or {}).get("audio_codec") == "eac3":
+                sound += " · 保留已有 Atmos"
+            elif mode != "none" and (audio_info or {}).get("audio_codec", "none") != "none":
+                sound += " · 转为普通音轨（不保留 Atmos）" if (audio_info or {}).get("atmos") == "confirmed" else " · 普通音轨（未确认 Atmos）"
         prefix = "保存到" if self._output_user_modified else "自动保存到"
         destination = self.output.text().strip()
         self.automatic_summary.setText(f"{picture}\n\n{sound}\n\n{prefix}：\n{Path(destination).name if destination else '视频所在文件夹'}")
@@ -1013,14 +1069,10 @@ class MainWindow(QMainWindow):
         if suitable:
             from quality import assess_bilibili
             suitable = assess_bilibili(info).get("status") != "fail"
-        codec = str(info.get("codec_name") or info.get("stream", {}).get("codec_name") or "unknown").lower()
-        containers = {name.strip().lower() for name in str(info.get("container") or info.get("format", {}).get("format_name") or "").split(",")}
-        # Annex B to MP4 changes the bitstream representation; use the native
-        # route rather than a copy that cannot pass strict payload validation.
-        annex_b = bool(containers & {"mpegts", "h264", "hevc"})
-        mp4_copyable = codec in {"h264", "hevc", "av1", "vp9", "mpeg4"} and not annex_b
-        self._smart_native_conversion = not mp4_copyable
-        key = "bili_preserve" if suitable and mp4_copyable else "preserve" if mp4_copyable else "quality"
+        width, height = info.get("display_width", info["width"]), info.get("display_height", info["height"])
+        suitable = suitable and max(width, height) <= 3840 and min(width, height) <= 2160 and info["fps"] <= 60
+        self._smart_native_conversion = False
+        key = "bili_preserve" if suitable else "bili_make"
         self._choosing_automatic = True
         self.select_data(self.export_preset, key)
         self._choosing_automatic = False
@@ -1036,8 +1088,26 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "start"):
             return
         ready = self.vinfo is not None and self.worker is None and not self.intake_busy
-        self.start.setEnabled(ready and not self.output_size_needs_attention())
+        unsupported_auto = self.current_route() != "preserve" and self.color.currentData() == "dv81" and self.rpu_mode.currentData() == "auto"
+        ambiguous_source = self.source_transfer_needs_attention()
+        self.start.setEnabled(ready and not self.output_size_needs_attention() and not unsupported_auto and not ambiguous_source)
+        self.start.setToolTip("请在“调整设置 → 源动态范围”中明确选择 SDR、HLG 或 PQ。" if ambiguous_source else "杜比视界 8.1 需要配套 RPU 文件；自动分析仅支持 8.4。" if unsupported_auto else "")
+        if ready and ambiguous_source:
+            self.top_status.setText("需要明确源动态范围")
+            self.stage_label.setText("请在“调整设置 → 源动态范围”中明确选择 SDR、HLG 或 PQ。")
+        elif ready and self.top_status.text() == "需要明确源动态范围":
+            size_attention = self.output_size_needs_attention()
+            self.top_status.setText("需要调整尺寸" if size_attention else "可以处理")
+            self.stage_label.setText("请在“调整设置”中选择更大输出尺寸。" if size_attention else "准备就绪，点击“开始处理”。")
+            self.notify("源动态范围已明确，可开始处理。" if self.source_transfer.currentData() != "auto" else "当前方案可直接处理。")
         self.update_automatic_summary()
+
+    def source_transfer_needs_attention(self):
+        if not self.vinfo or self.current_route() == "preserve" or self.source_transfer.currentData() != "auto":
+            return False
+        transfer = str(self.vinfo.get("color_transfer") or "").lower()
+        wide_gamut = self.vinfo.get("color_primaries") == "bt2020" or self.vinfo.get("color_space") == "bt2020nc"
+        return transfer in ("", "unknown", "unspecified") and wide_gamut
 
     def toggle_window_state(self):
         if self.isMaximized():
@@ -1077,7 +1147,10 @@ class MainWindow(QMainWindow):
             "interp": route == "enhance" and self.interp.isChecked(),
             "target_fps": rate or (120 if self.interp.isChecked() else source_rate),
             "color_mode": self.color.currentData(),
-            "rpu": self.rpu.filepath if route != "preserve" and self.color.currentData() in ("dv81", "dv84") else "",
+            "rpu": self.rpu.filepath if route != "preserve" and self.color.currentData() in ("dv81", "dv84") and self.rpu_mode.currentData() == "external" else "",
+            "rpu_mode": self.rpu_mode.currentData(), "hdr_remaster": self.hdr_remaster.currentData(),
+            "hdr_peak_nits": self._hdr_peak_nits,
+            "source_transfer_override": self.source_transfer.currentData() if route != "preserve" else "auto",
             "audio_mode": self.audio_mode.currentData(), "auto_clean": self.clean.isChecked(),
             "preset": self.encoding_preset.currentData(), "crf": self.crf.value(),
             "batch_size": self.batch_size.value(), "require_atmos": False,
@@ -1103,7 +1176,11 @@ class MainWindow(QMainWindow):
                 width = self.vinfo.get("display_width", self.vinfo["width"])
                 height = self.vinfo.get("display_height", self.vinfo["height"])
                 if max(width, height) > 3840 or min(width, height) > 2160:
-                    self.select_data(self.resolution, (3840, 2160) if width >= height else (2160, 3840))
+                    scale = min(3840 / max(width, height), 2160 / min(width, height))
+                    size = max(2, int(width * scale) // 2 * 2), max(2, int(height * scale) // 2 * 2)
+                    if not self.select_data(self.resolution, size):
+                        self.resolution.addItem(f"自动适配 · {size[0]} × {size[1]}", size)
+                        self.select_data(self.resolution, size)
                 if self.vinfo["fps"] > 60:
                     self.select_data(self.fps, 60)
         elif key == "quality":
@@ -1136,25 +1213,50 @@ class MainWindow(QMainWindow):
             control.setEnabled(route != "preserve" and not running)
         self.ai.setEnabled(route == "enhance" and not running)
         self.interp.setEnabled(route == "enhance" and not running)
+        self.source_transfer.setEnabled(route != "preserve" and not running)
         self.model.setEnabled(route == "enhance" and self.ai.isChecked() and not running)
         self.work_size.setEnabled(route == "enhance" and not running)
         for control in (self.encoding_preset, self.crf, self.batch_size):
             control.setEnabled(route != "preserve" and not running)
-        needs_rpu = route != "preserve" and self.color.currentData() in ("dv81", "dv84")
-        self.rpu.setVisible(needs_rpu)
-        self.rpu_label.setVisible(needs_rpu)
-        self.rpu.setEnabled(needs_rpu and not running)
-        if needs_rpu:
+        making_dolby = route != "preserve" and self.color.currentData() in ("dv81", "dv84")
+        self.rpu_mode.model().item(0).setEnabled(not (making_dolby and self.color.currentData() == "dv81"))
+        external_rpu = making_dolby and self.rpu_mode.currentData() == "external"
+        self.rpu_mode.setVisible(making_dolby)
+        self.rpu_mode_label.setVisible(making_dolby)
+        self.rpu_mode.setEnabled(making_dolby and not running)
+        self.rpu.setVisible(external_rpu)
+        self.rpu_label.setVisible(external_rpu)
+        self.rpu.setEnabled(external_rpu and not running)
+        hdr_output = route != "preserve" and self.color.currentData() != "sdr"
+        self.hdr_remaster.setVisible(hdr_output)
+        self.hdr_remaster_label.setVisible(hdr_output)
+        self.hdr_remaster.setEnabled(hdr_output and not running)
+        if external_rpu:
             self.advanced_toggle.setChecked(True)
         self.audio_clear.setEnabled(bool(self.audio.filepath) and not running and not self.intake_busy)
         self.update_estimates()
+        self.refresh_start_state()
+
+    def color_selected(self):
+        if not self.restore_in_progress and self.current_route() != "preserve" and self.color.currentData() == "dv81" and self.rpu_mode.currentData() == "auto":
+            self.select_data(self.rpu_mode, "external")
+            self.notify("杜比视界 8.1 需要配套 RPU 文件；自动逐帧分析当前支持 8.4。")
+        self.update_control_states()
 
     def update_rpu_state(self):
         self.update_control_states()
 
+    def rpu_selected(self, path):
+        if path and not self.restore_in_progress:
+            self.select_data(self.rpu_mode, "external")
+        self.update_control_states()
+        self.update_automatic_summary()
+
     def toggle_advanced(self, enabled):
         self.advanced.setVisible(enabled)
         self.advanced_toggle.setArrowType(Qt.DownArrow if enabled else Qt.RightArrow)
+        if enabled:
+            QTimer.singleShot(0, lambda: self.content_scroll.verticalScrollBar().setValue(self.advanced.y()))
 
     def toggle_log(self, enabled):
         self.log.setVisible(enabled)
@@ -1256,8 +1358,9 @@ class MainWindow(QMainWindow):
         result_visible = self.last_output is not None or (self._preserve_restored_settings and self.outcome is not None)
         if self.worker is None and not result_visible:
             attention = self.output_size_needs_attention()
-            self.top_status.setText("需要调整尺寸" if attention else "可以处理")
-            self.stage_label.setText("请在“调整设置”中选择更大输出尺寸。" if attention else "准备就绪，点击“开始处理”。")
+            ambiguous_source = self.source_transfer_needs_attention()
+            self.top_status.setText("需要明确源动态范围" if ambiguous_source else "需要调整尺寸" if attention else "可以处理")
+            self.stage_label.setText("请在“调整设置 → 源动态范围”中明确选择 SDR、HLG 或 PQ。" if ambiguous_source else "请在“调整设置”中选择更大输出尺寸。" if attention else "准备就绪，点击“开始处理”。")
         if not result_visible:
             self.render_source_quality()
         self.update_estimates()
@@ -1269,7 +1372,12 @@ class MainWindow(QMainWindow):
             from quality import assess_bilibili
             report = assess_bilibili(self.vinfo)
             self.last_report = report
-            if self.export_preset.currentData().startswith("bili_"):
+            if self.export_preset.currentData() == "bili_make":
+                self.quality_status.setText("素材已读取 · 将自动制作杜比视界")
+                self.quality_status.setStyleSheet("color:#374151;font-weight:600")
+                self.quality_details.setText("素材无需自带杜比元数据。自动模式将分析最终画面，生成 Profile 8.4 元数据；成片仍会接受本地格式与解码检查，平台识别需草稿转码验收。")
+                self.view_report.setEnabled(True)
+            elif self.export_preset.currentData().startswith("bili_"):
                 self.render_quality(report, "素材检查")
             else:
                 self.quality_status.setText("素材已读取")
@@ -1373,6 +1481,10 @@ class MainWindow(QMainWindow):
             self.video.set_file(cfg["video"])
             self.audio.set_file(cfg.get("audio", ""))
             self.rpu.set_file(cfg.get("rpu", ""))
+            self.select_data(self.rpu_mode, cfg.get("rpu_mode", "external" if cfg.get("rpu") else "auto"))
+            self.select_data(self.hdr_remaster, cfg.get("hdr_remaster", "auto"))
+            self.select_data(self.source_transfer, cfg.get("source_transfer_override", "auto"))
+            self._hdr_peak_nits = cfg.get("hdr_peak_nits", 600)
             self.output.setText(str(cfg.get("output", "")))
             self._output_user_modified = bool(cfg.get("output"))
             for combo, key in [(self.model, "model"), (self.color, "color_mode"), (self.audio_mode, "audio_mode"), (self.encoding_preset, "preset")]:
@@ -1426,6 +1538,10 @@ class MainWindow(QMainWindow):
             self.notify("兼容转码的尺寸需至少 64 × 48。请在“调整设置”中选择输出尺寸。", True)
             self.advanced_toggle.setChecked(True)
             return
+        if self.source_transfer_needs_attention():
+            self.notify("源文件动态范围标记缺失，请在“调整设置 → 源动态范围”中明确选择 SDR、HLG 或 PQ 后再开始。", True)
+            self.advanced_toggle.setChecked(True)
+            return
         if not cfg["output"]:
             self.choose_output()
             cfg["output"] = self.output.text().strip()
@@ -1434,11 +1550,24 @@ class MainWindow(QMainWindow):
         if Path(cfg["output"]).resolve() == Path(cfg["video"]).resolve() or Path(cfg["output"]).exists():
             QMessageBox.warning(self, "请选择新输出文件", "输出不能覆盖素材或现有文件，请更换文件名。")
             return
-        if cfg["route"] != "preserve" and cfg["color_mode"] in ("dv81", "dv84") and not Path(cfg["rpu"]).is_file():
+        making_dolby = cfg["route"] != "preserve" and cfg["color_mode"] in ("dv81", "dv84")
+        if making_dolby and cfg["color_mode"] == "dv81" and cfg["rpu_mode"] == "auto":
+            QMessageBox.warning(self, "8.1 需要配套元数据", "自动逐帧分析当前支持杜比视界 8.4。制作 8.1 请在“调整设置”中选择“使用配套 RPU 文件”。")
+            self.advanced_toggle.setChecked(True)
+            return
+        if making_dolby and cfg["rpu_mode"] == "external" and not Path(cfg["rpu"]).is_file():
             QMessageBox.warning(self, "需要配套杜比元数据", "请提供与最终画面、调色和帧数匹配的 RPU.bin。已有 Dolby Vision 8.4 原片可改用“保留原片”方案。")
             return
+        if making_dolby:
+            try:
+                find_tool("dovi_tool")
+            except FileNotFoundError:
+                message = "缺少杜比制作工具 dovi_tool，无法生成杜比成片。请关闭工作站后运行 setup.bat 完成基础工具安装，再重新打开。也可以在高级安装中执行 setup.ps1 -CoreOnly -WithDovi。当前不会导出普通视频代替。"
+                self.notify(message, True)
+                QMessageBox.warning(self, "需要安装杜比制作工具", message)
+                return
         if cfg["route"] == "preserve" and cfg["delivery"] == "bilibili" and self.last_report and self.last_report.get("status") == "fail":
-            QMessageBox.warning(self, "原片还不符合目标格式", "当前原片未满足 B站杜比 8.4 的本地技术检查。请选择“HLG / 8.4 制作”并提供配套 RPU，或使用常规高质量导出。\n\n" + self.last_report.get("summary", ""))
+            QMessageBox.warning(self, "原片还不符合目标格式", "当前原片未满足 B站杜比 8.4 的本地技术检查。请选择“B站杜比 · 自动制作”，或手选其他导出方式。\n\n" + self.last_report.get("summary", ""))
             return
         self.save_preferences()
         cfg["resume"] = False
@@ -1552,7 +1681,8 @@ class MainWindow(QMainWindow):
         if "缺少" in message or "找不到" in message:
             advice = "请检查素材路径，或运行 setup.bat 补齐工具与模型。"
         elif "rpu" in lower or "元数据" in message:
-            advice = "请确认 RPU 的 Profile、画面调色、时序和帧数与最终输出匹配。"
+            advice = ("自动杜比分析未完成。请运行 setup.bat 检查工具安装，展开详细信息查看失败阶段，并保留日志后重试。"
+                      if self.rpu_mode.currentData() == "auto" else "请确认 RPU 的 Profile、画面调色、时序和帧数与最终输出匹配。")
         elif "space" in lower or "空间" in message:
             advice = "请为工作目录和输出目录预留磁盘空间，或降低输出尺寸与批次数量。"
         box = QMessageBox(QMessageBox.Critical, "处理未完成", first_line[:300] + "\n\n" + advice, QMessageBox.Ok, self)
@@ -1604,7 +1734,7 @@ class MainWindow(QMainWindow):
 
     def save_preferences(self):
         cfg = self.config()
-        keys = ("color_mode", "audio_mode", "model", "preset", "crf", "batch_size", "auto_clean")
+        keys = ("color_mode", "audio_mode", "model", "preset", "crf", "batch_size", "auto_clean", "hdr_remaster")
         data = {key: cfg[key] for key in keys}
         data.update({"version": 1, "export_preset": self.export_preset.currentData(),
                      "resolution": self.resolution.currentData(), "fps": self.fps.currentData()})
@@ -1623,7 +1753,8 @@ class MainWindow(QMainWindow):
                 return
             self.select_data(self.export_preset, data.get("export_preset", "bili_preserve"))
             for combo, key in [(self.resolution, "resolution"), (self.fps, "fps"), (self.color, "color_mode"),
-                               (self.audio_mode, "audio_mode"), (self.model, "model"), (self.encoding_preset, "preset")]:
+                               (self.audio_mode, "audio_mode"), (self.model, "model"), (self.encoding_preset, "preset"),
+                               (self.hdr_remaster, "hdr_remaster")]:
                 if key in data:
                     self.select_data(combo, data[key])
             self.crf.setValue(data.get("crf", 18))

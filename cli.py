@@ -1,5 +1,6 @@
 """Command-line interface, usable without PyQt5."""
 import argparse
+from fractions import Fraction
 import signal
 import sys
 
@@ -12,6 +13,7 @@ def main(argv=None):
     parser.add_argument("-o", "--output", help="新的 MP4 输出路径；不会覆盖已有文件")
     parser.add_argument("--route", choices=("preserve", "transcode", "enhance"), default="preserve", help="默认原片保留")
     parser.add_argument("--delivery", choices=("general", "bilibili"), default="general")
+    parser.add_argument("--auto-dolby", action="store_true", help="自动制作 B站杜比视界 8.4；合规原片直接保留，其他素材自动分析生成元数据（4K60以内）")
     ai = parser.add_mutually_exclusive_group()
     ai.add_argument("--ai", action="store_true", help="增强路线主动启用 Real-ESRGAN")
     ai.add_argument("--no-ai", action="store_true", help="禁用 Real-ESRGAN（默认）")
@@ -23,6 +25,10 @@ def main(argv=None):
     parser.add_argument("--work-size", default="1920x1080", help="AI SDR 工作尺寸上限")
     parser.add_argument("--color", choices=("source", "sdr", "hdr10", "hlg", "dv81", "dv84"), default="source")
     parser.add_argument("--rpu", default="", help="与最终画面、色彩和帧数匹配的 Profile 8.1 / 8.4 RPU.bin")
+    parser.add_argument("--rpu-mode", choices=("auto", "external"), help="杜比元数据：auto 自动逐帧分析；external 使用 --rpu，默认按是否提供 RPU 自动选择")
+    parser.add_argument("--hdr-remaster", choices=("auto", "off"), help="auto 对普通 SDR 扩展 HDR 亮度；HDR 原片不二次扩展，默认按制作模式选择")
+    parser.add_argument("--hdr-peak-nits", type=int, choices=range(100, 1001), metavar="100..1000", help="SDR 自动 HDR 制作的峰值亮度，默认 600 nits")
+    parser.add_argument("--source-transfer", choices=("auto", "bt709", "arib-std-b67", "smpte2084"), help="源动态范围解释：自动、SDR BT.709、HLG 或 PQ；缺少 BT.2020 动态范围标记时需明确选择")
     parser.add_argument("--audio", default="", help="可选外部音频")
     parser.add_argument("--audio-mode", choices=("copy", "aac", "eac3", "none"), default="copy")
     parser.add_argument("--require-atmos", action="store_true", help="仅在最终文件确认保留 Atmos 时成功")
@@ -34,6 +40,8 @@ def main(argv=None):
     parser.add_argument("--workspace", default=str(WORKSPACE))
     parser.add_argument("--resume", action="store_true", help="使用工作目录中原任务的完整参数恢复")
     args = parser.parse_args(argv)
+    supplied = list(argv if argv is not None else sys.argv[1:])
+    explicit = {token.split("=", 1)[0] for token in supplied if token.startswith("-")}
     try:
         if args.resume:
             from pathlib import Path
@@ -41,7 +49,6 @@ def main(argv=None):
             if not cp:
                 parser.error("工作目录中没有可恢复的断点")
             # Restoring always uses the original settings; reject ignored options.
-            supplied = argv if argv is not None else sys.argv[1:]
             allowed = {"--resume", "--workspace"}
             if any(token.startswith("-") and token.split("=", 1)[0] not in allowed for token in supplied):
                 parser.error("--resume 仅可与 --workspace 一起使用；恢复原任务参数")
@@ -49,10 +56,18 @@ def main(argv=None):
         else:
             if not args.input:
                 parser.error("新任务需要 --input")
-            if (args.ai or args.interp) and args.route != "enhance":
+            if args.auto_dolby and explicit & {"--route", "--delivery", "--color"}:
+                parser.error("--auto-dolby 自动选择路线、B站交付和杜比 8.4；请勿同时指定 --route / --delivery / --color")
+            if args.rpu and args.rpu_mode == "auto":
+                parser.error("--rpu 与 --rpu-mode auto 冲突；手动 RPU 请用 external 或省略 --rpu-mode")
+            if args.rpu_mode == "external" and not args.rpu:
+                parser.error("--rpu-mode external 需要 --rpu 文件")
+            if (args.ai or args.interp) and (args.auto_dolby or args.route != "enhance"):
                 parser.error("--ai / --interp 需要 --route enhance")
-            if args.route == "preserve" and (args.size or args.fps or args.rpu or args.color != "source"):
+            if not args.auto_dolby and args.route == "preserve" and (args.size or args.fps or args.rpu or args.color != "source"):
                 parser.error("原片保留沿用原视频；改变尺寸、帧率、色彩或 RPU 请使用 --route transcode")
+            if not args.auto_dolby and args.route == "preserve" and args.source_transfer not in (None, "auto"):
+                parser.error("原片保留不能改写源动态范围解释；--source-transfer 请配合 --route transcode 或 --auto-dolby")
             if args.interp and not args.fps:
                 parser.error("RIFE 插帧需要明确 --fps")
             if args.route == "enhance" and args.fps and not args.interp:
@@ -65,23 +80,55 @@ def main(argv=None):
                     return pair
                 except ValueError:
                     parser.error("尺寸应为 WIDTHxHEIGHT，宽高为 16–8192 的偶数")
-            from quality import inspect_media
+            from quality import inspect_media, assess_bilibili, inspect_audio
             source = inspect_media(args.input)
             width, height = dimensions(args.size) if args.size else (source["display_width"], source["display_height"])
             work_width, work_height = dimensions(args.work_size)
+            route, delivery = args.route, args.delivery
+            fps = args.fps
             color = args.color
-            if color == "source" and args.route == "enhance":
+            audio_mode = args.audio_mode
+            if args.auto_dolby:
+                suitable = assess_bilibili(source).get("status") != "fail"
+                unchanged = not (args.size or fps or args.rpu or args.rpu_mode == "external" or args.source_transfer not in (None, "auto"))
+                within_limits = max(width, height) <= 3840 and min(width, height) <= 2160 and source["fps"] <= 60
+                route = "preserve" if suitable and unchanged and within_limits else "transcode"
+                delivery, color = "bilibili", "dv84"
+                scale = min(1, 3840 / max(width, height), 2160 / min(width, height))
+                if scale < 1:
+                    width, height = max(2, int(width * scale) // 2 * 2), max(2, int(height * scale) // 2 * 2)
+                if Fraction(str(fps or source["fps_fraction"])) > 60:
+                    fps = "60"
+                if "--audio-mode" not in explicit:
+                    audio = inspect_audio(args.audio) if args.audio else source
+                    if audio.get("audio_codec", "none") not in ("none", "aac", "ac3", "eac3", "mp3", "alac"):
+                        audio_mode = "aac"
+            if color == "source" and route == "enhance":
                 color = "sdr"
+            transfer_unknown = str(source.get("color_transfer") or "").lower() in ("", "unknown", "unspecified")
+            wide_gamut = source.get("color_primaries") == "bt2020" or source.get("color_space") == "bt2020nc"
+            if route != "preserve" and args.source_transfer in (None, "auto") and transfer_unknown and wide_gamut:
+                parser.error("源文件缺少动态范围标记且含 BT.2020 信号；请用 --source-transfer bt709 / arib-std-b67 / smpte2084 明确源解释")
+            if route != "preserve" and color == "dv81" and not args.rpu:
+                parser.error("杜比视界 8.1 需要 --rpu 外部元数据；自动逐帧分析当前仅支持 8.4")
             cfg = {"video": args.input, "output": args.output, "audio": args.audio,
-                   "route": args.route, "delivery": args.delivery, "require_atmos": args.require_atmos,
-                   "ai": args.ai, "interp": args.interp, "target_fps": args.fps or source["fps_fraction"],
+                   "route": route, "delivery": delivery, "require_atmos": args.require_atmos,
+                   "ai": args.ai, "interp": args.interp, "target_fps": fps or source["fps_fraction"],
                    "width": width, "height": height, "color_mode": color, "rpu": args.rpu,
                    "work_width": work_width, "work_height": work_height,
-                   "audio_mode": args.audio_mode, "model": args.model, "batch_size": args.batch_size,
+                   "audio_mode": audio_mode, "model": args.model, "batch_size": args.batch_size,
                    "preset": args.preset, "crf": args.crf, "auto_clean": not args.keep_temp,
                    "workspace": args.workspace}
-            if args.route == "transcode" and args.fps:
-                cfg["fps_override"] = args.fps
+            if args.rpu_mode or args.rpu or (route != "preserve" and color in ("dv81", "dv84")):
+                cfg["rpu_mode"] = args.rpu_mode or ("external" if args.rpu else "auto")
+            if args.hdr_remaster is not None:
+                cfg["hdr_remaster"] = args.hdr_remaster
+            if args.hdr_peak_nits is not None:
+                cfg["hdr_peak_nits"] = args.hdr_peak_nits
+            if args.source_transfer is not None:
+                cfg["source_transfer_override"] = args.source_transfer
+            if route == "transcode" and fps:
+                cfg["fps_override"] = fps
         runner = Pipeline(cfg, log=print, progress=lambda p: print(f"[进度] {p:.1f}%"),
                           stage=lambda name, *_: print(f"[阶段] {name}"))
         signal.signal(signal.SIGINT, lambda *_: runner.cancel())

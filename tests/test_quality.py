@@ -226,6 +226,25 @@ class ReadinessTests(unittest.TestCase):
 
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg required")
 class ActualMediaTests(unittest.TestCase):
+    def test_real_hlg_matroska_with_b_frames_reports_decoded_vui_colors(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp).resolve() / "HLG with delayed frames.mkv"
+            result = subprocess.run([shutil.which("ffmpeg"), "-v", "error", "-f", "lavfi", "-i",
+                                     "testsrc2=size=192x128:rate=12", "-frames:v", "12", "-c:v", "libx265",
+                                     "-preset", "ultrafast", "-pix_fmt", "yuv420p10le",
+                                     "-x265-params", "lossless=1:frame-threads=1:bframes=3:colorprim=bt2020:transfer=arib-std-b67:colormatrix=bt2020nc",
+                                     "-color_primaries", "bt2020", "-color_trc", "arib-std-b67",
+                                     "-colorspace", "bt2020nc", "-color_range", "tv", str(path)],
+                                    capture_output=True, text=True, timeout=30)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            info = quality.inspect_media(path, mediainfo="")
+            self.assertEqual(info["color_transfer"], "arib-std-b67")
+            self.assertEqual(info["color_primaries"], "bt2020")
+            self.assertEqual(info["stream"]["color_transfer"], "arib-std-b67")
+            self.assertEqual(info["stream"]["color_primaries"], "bt2020")
+            self.assertEqual(info["width"], 192)
+            self.assertEqual(info["height"], 128)
+
     def test_actual_external_eac3_audio_is_inspected_without_claiming_atmos(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp).resolve() / "external audio.eac3"
@@ -267,6 +286,65 @@ class ActualMediaTests(unittest.TestCase):
 
 
 class InspectionControlTests(unittest.TestCase):
+    def test_frame_color_fallback_targets_main_video_and_keeps_explicit_values(self):
+        data = fixture()
+        video = data["streams"][0]
+        video.update(index=3, color_primaries="unknown", color_space="unspecified")
+        cover = {"index": 0, "codec_type": "video", "codec_name": "mjpeg",
+                 "disposition": {"attached_pic": 1}, "width": 400, "height": 400}
+        data["streams"].insert(0, cover)
+        frames = {"frames": [
+            {"media_type": "video", "stream_index": 0, "color_primaries": "bt709"},
+            {"media_type": "audio", "stream_index": 1, "color_primaries": "bt709"},
+            {"media_type": "video", "stream_index": 3, "color_primaries": "bt2020",
+             "color_space": "bt2020nc", "color_transfer": "smpte2084", "color_range": "pc"},
+        ]}
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "placeholder.mp4"
+            path.write_bytes(b"placeholder")
+            with patch.object(quality, "_run_json", side_effect=[data, frames]) as probe:
+                info = quality.inspect_media(path, ffprobe="ffprobe", mediainfo="")
+        self.assertEqual(info["stream"]["index"], 3)
+        self.assertEqual(info["color_primaries"], "bt2020")
+        self.assertEqual(info["stream"]["color_space"], "bt2020nc")
+        self.assertEqual(info["color_transfer"], "arib-std-b67", "explicit stream transfer was overwritten")
+        self.assertEqual(info["color_range"], "tv", "explicit stream range was overwritten")
+        command = probe.call_args_list[1].args[0]
+        self.assertEqual(command[command.index("-select_streams") + 1], "3")
+        self.assertIn("-show_frames", command)
+
+    def test_complete_stream_colors_skip_extra_frame_decoding(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "placeholder.mp4"
+            path.write_bytes(b"placeholder")
+            with patch.object(quality, "_run_json", return_value=fixture()) as probe:
+                quality.inspect_media(path, ffprobe="ffprobe", mediainfo="")
+            self.assertEqual(probe.call_count, 1)
+
+    def test_cancellation_during_frame_color_fallback_is_not_swallowed(self):
+        data = fixture()
+        del data["streams"][0]["color_transfer"]
+        cancel = threading.Event()
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "placeholder.mp4"
+            path.write_bytes(b"placeholder")
+            with patch.object(quality, "_run_json", side_effect=[data, quality.QualityCancelled("stopped")]) as probe:
+                with self.assertRaises(quality.QualityCancelled):
+                    quality.inspect_media(path, ffprobe="ffprobe", mediainfo="", cancel_event=cancel)
+            self.assertIs(probe.call_args_list[1].kwargs["cancel_event"], cancel)
+
+    def test_failed_frame_color_fallback_keeps_unknown_instead_of_guessing_hdr(self):
+        data = fixture()
+        del data["streams"][0]["color_transfer"]
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "placeholder.mp4"
+            path.write_bytes(b"placeholder")
+            with patch.object(quality, "_run_json", side_effect=[data, quality.QualityError("decode failed")]):
+                info = quality.inspect_media(path, ffprobe="ffprobe", mediainfo="")
+        self.assertEqual(info["color_transfer"], "unknown")
+        self.assertNotIn("color_transfer", info["stream"])
+        self.assertTrue(any("decode failed" in note for note in info["inspection_notes"]))
+
     def test_cancel_terminates_a_silent_long_running_probe(self):
         cancel = threading.Event()
         children = []

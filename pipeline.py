@@ -20,7 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent
 TOOLS_DIR = BASE_DIR / "tools"
 WORKSPACE = BASE_DIR / "workspace"
 CHECKPOINT_FILE = WORKSPACE / "checkpoint.json"
-VERSION = "2.2"
+VERSION = "2.3"
 
 
 class PipelineError(RuntimeError):
@@ -84,8 +84,9 @@ def estimate_disk(info, cfg):
     if cfg.get("route") in ("preserve", "transcode"):
         # Compressed output + staging copy. Native routes do not extract PNGs.
         bitrate = max(float(info.get("video_bit_rate") or info.get("bit_rate") or 0), 30_000_000)
-        copies = 3 if cfg.get("color_mode") in ("dv81", "dv84") else 2
-        mb = info["duration"] * bitrate / 8 / 1024**2 * copies * 1.5 + 256
+        copies = 5 if cfg.get("color_mode") in ("dv81", "dv84") else 2
+        analysis_mb = info["duration"] * max(float(info["fps"]), 60) * 1600 / 1024**2 if cfg.get("rpu_mode") == "auto" else 0
+        mb = info["duration"] * bitrate / 8 / 1024**2 * copies * 1.5 + 256 + analysis_mb
         return mb, "原片封装/高精度直编不拆帧；按码率预留输出与校验中间文件，实际体积随内容变化"
     scale = min(1, int(cfg.get("work_width", 1920)) / width, int(cfg.get("work_height", 1080)) / height) if cfg.get("ai", True) else 1
     pixels = math.ceil(width * scale) * math.ceil(height * scale)
@@ -167,13 +168,13 @@ class Pipeline:
         if self._cancel.is_set():
             raise PipelineCancelled("任务已停止，可从已完成阶段恢复")
 
-    def _run(self, cmd):
+    def _run(self, cmd, cwd=None):
         self._boundary()
         self.log("[命令] " + subprocess.list2cmdline([str(a) for a in cmd]))
         # Keep draining the pipe during pause. Pause takes effect before the next command.
         process = subprocess.Popen([str(a) for a in cmd], stdout=subprocess.PIPE,
                                    stderr=subprocess.STDOUT, text=True, encoding="utf-8",
-                                   errors="replace", **_hidden())
+                                   errors="replace", cwd=cwd, **_hidden())
         self._process = process
         lines = queue.Queue(maxsize=256)
         tail = deque(maxlen=80)
@@ -261,6 +262,19 @@ class Pipeline:
         if cfg["delivery"] not in ("general", "bilibili"):
             raise PipelineError("不支持的交付平台")
         self.info = self._inspect(video)
+        if cfg["route"] != "preserve" and self.info.get("dv_profile") == 5:
+            raise PipelineError("Profile 5 使用专用 IPT 色彩编码，当前 CPU 制作流程不能直接转换；请先通过支持杜比解码的工具输出 HLG/PQ 母版，或选择原片保留")
+        cfg.setdefault("source_transfer_override", "auto")
+        if cfg["source_transfer_override"] not in ("auto", "bt709", "arib-std-b67", "smpte2084"):
+            raise PipelineError("源动态范围须为自动、SDR、HLG 或 PQ")
+        source_transfer = self.info.get("color_transfer")
+        if cfg["source_transfer_override"] != "auto":
+            if cfg["route"] == "preserve":
+                raise PipelineError("原片保留不能更改源动态范围解释，请选择重新制作")
+            source_transfer = cfg["source_transfer_override"]
+        elif cfg["route"] != "preserve" and source_transfer in (None, "unknown", "unspecified", "reserved"):
+            if self.info.get("color_primaries") == "bt2020" or self.info.get("color_space") in ("bt2020nc", "bt2020c"):
+                raise PipelineError("源片使用 BT.2020 但缺少可确认的传递函数；请在调整设置中选择源动态范围（SDR、HLG 或 PQ），避免错误扩展")
         if cfg["route"] in ("preserve", "transcode"):
             cfg["ai"] = False
             cfg["interp"] = False
@@ -269,7 +283,7 @@ class Pipeline:
             if cfg["route"] == "preserve":
                 cfg["width"], cfg["height"] = self.info["width"], self.info["height"]
             if cfg.get("color_mode", "source") == "source":
-                cfg["color_mode"] = {"smpte2084": "hdr10", "arib-std-b67": "hlg"}.get(self.info["color_transfer"], "sdr")
+                cfg["color_mode"] = {"smpte2084": "hdr10", "arib-std-b67": "hlg"}.get(source_transfer, "sdr")
         cfg.setdefault("color_mode", "sdr")
         cfg.setdefault("audio_mode", "copy")
         cfg.setdefault("ai", True)
@@ -280,6 +294,19 @@ class Pipeline:
         cfg.setdefault("batch_size", 64)
         cfg.setdefault("target_fps", 120)
         cfg.setdefault("model", "realesrgan-x4plus")
+        self._dolby_defaults(cfg)
+        if cfg["rpu_mode"] not in ("auto", "external"):
+            raise PipelineError("杜比元数据模式须为 auto 或 external")
+        if cfg["hdr_remaster"] not in ("auto", "off"):
+            raise PipelineError("HDR 重制模式须为 auto 或 off")
+        try:
+            peak = float(cfg["hdr_peak_nits"])
+        except (TypeError, ValueError):
+            peak = float("nan")
+        if not math.isfinite(peak) or not 100 <= peak <= 1000:
+            raise PipelineError("HDR 高光目标须在 100 到 1000 nits 之间")
+        if cfg.get("rpu") and cfg["rpu_mode"] == "auto":
+            raise PipelineError("自动元数据与手动 RPU 不能同时使用")
         if cfg["color_mode"] not in ("sdr", "hdr10", "dv81", "hlg", "dv84"):
             raise PipelineError("不支持的色彩模式")
         if cfg["audio_mode"] not in ("copy", "aac", "eac3", "none"):
@@ -301,7 +328,7 @@ class Pipeline:
         for key in ("video", "audio", "rpu"):
             if cfg.get(key) and self.output == Path(cfg[key]).resolve():
                 raise PipelineError("输出路径不能与输入相同")
-        if cfg["route"] == "enhance" and self.info["color_transfer"] in ("smpte2084", "arib-std-b67"):
+        if cfg["route"] == "enhance" and source_transfer in ("smpte2084", "arib-std-b67"):
             raise PipelineError("当前 AI 管线使用 SDR RGB 工作帧；HDR 源请先用受控色调映射转为 SDR，避免丢失原始 HDR 色彩")
         self.source_rate = Fraction(self.info["fps_fraction"])
         self.rate = Fraction(str(cfg["target_fps"])) if cfg["interp"] else self.source_rate
@@ -331,8 +358,15 @@ class Pipeline:
             if not all((self.models / f"{model}.{ext}").is_file() for ext in ("bin", "param")):
                 raise PipelineError(f"缺少超分模型 {model}，请运行 setup.bat")
         if cfg["route"] != "preserve" and cfg["color_mode"] in ("dv81", "dv84"):
-            if not cfg.get("rpu"):
+            if cfg["rpu_mode"] == "auto" and cfg["color_mode"] != "dv84":
+                raise PipelineError("自动逐帧分析当前支持 Profile 8.4；8.1 请选择外部配套 RPU，或改为 8.4")
+            if cfg["rpu_mode"] == "external" and not cfg.get("rpu"):
                 raise PipelineError("杜比视界需要与最终调色、HLG/PQ 基础层及帧数匹配的 RPU.bin；B站路线使用 Profile 8.4 / HLG")
+            if cfg["rpu_mode"] == "auto":
+                try:
+                    import dolby_analysis
+                except ImportError as exc:
+                    raise PipelineError("缺少逐帧分析依赖，请运行 setup.bat -CoreOnly 安装") from exc
             find_tool("dovi_tool")
             bsfs = self._run([find_tool("ffmpeg"), "-hide_banner", "-bsfs"])
             if not all(re.search(rf"\b{name}\b", bsfs) for name in ("dovi_rpu", "setts")):
@@ -371,6 +405,7 @@ class Pipeline:
             self.job_dir = self.root / "jobs" / job_id
             self.manifest = json.loads((self.job_dir / "manifest.json").read_text(encoding="utf-8"))
             original = {k: v for k, v in self.manifest["cfg"].items() if k != "resume"}
+            self._dolby_defaults(original)
             current = {k: v for k, v in cfg.items() if k != "resume"}
             if original != current or self.manifest["inputs"] != inputs:
                 raise PipelineError("输入文件或处理参数已改变，请新建任务")
@@ -382,6 +417,102 @@ class Pipeline:
                              "completed": [], "chunks": [], "stage": "准备", "elapsed": 0}
         self._prior_elapsed = self.manifest.get("elapsed", 0)
         self._save()
+
+    @staticmethod
+    def _dolby_defaults(cfg):
+        cfg.setdefault("source_transfer_override", "auto")
+        cfg.setdefault("rpu_mode", "external" if cfg.get("rpu") else "auto")
+        automatic = cfg.get("route") != "preserve" and cfg.get("color_mode") == "dv84" and cfg["rpu_mode"] == "auto"
+        cfg.setdefault("hdr_remaster", "auto" if automatic else "off")
+        cfg.setdefault("hdr_peak_nits", 600)
+
+    def _file_hash(self, path):
+        digest = hashlib.sha256()
+        with Path(path).open("rb") as source:
+            for block in iter(lambda: source.read(1024 * 1024), b""):
+                self._boundary()
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _remaster_filter(self, source_transfer):
+        """Used only after conversion to linear BT.2020, with 1 = 100 nits."""
+        active = self.cfg["hdr_remaster"] == "auto" and source_transfer not in ("smpte2084", "arib-std-b67") and self.cfg["color_mode"] != "sdr"
+        report = {"active": False, "source_transfer": source_transfer,
+                  "reason": "HDR 源保持原动态范围" if source_transfer in ("smpte2084", "arib-std-b67") else "未启用 SDR 高光扩展"}
+        if active:
+            from hdr_remaster import write_lut
+            report.update(write_lut(self.job_dir / "hdr-remaster.cube", self.cfg["hdr_peak_nits"], self._boundary))
+            report["reason"] = "已对 SDR 应用保色相高光扩展"
+        self.manifest["hdr_remaster"] = report
+        return "lut3d=file=hdr-remaster.cube:interp=tetrahedral," if active else ""
+
+    def _ensure_rpu(self, joined):
+        wanted = self.manifest["output_frames"]
+        if self.cfg["rpu_mode"] == "external":
+            self.rpu_path = Path(self.cfg["rpu"])
+            self._validate_rpu(wanted)
+            return
+        from dolby_analysis import METHOD, analyze_video, verify_rpu
+        self.stage("4/6 逐帧分析并生成杜比元数据", 4, 6)
+        folder = self.job_dir / "auto-dolby"
+        if "auto_rpu" in self.manifest["completed"]:
+            report = self.manifest.get("dolby_analysis") or {}
+            self.rpu_path = Path(report.get("rpu", folder / "missing.bin"))
+            if (report.get("method") != METHOD or not self.rpu_path.is_relative_to(folder) or not self.rpu_path.is_file()
+                    or report.get("source_sha256") != self._file_hash(joined)
+                    or report.get("rpu_sha256") != self._file_hash(self.rpu_path)):
+                raise PipelineError("自动杜比分析缓存已改变，请新建任务，避免使用不匹配元数据")
+            verify_rpu(find_tool("dovi_tool"), self.rpu_path, report, cancel_check=self._boundary)
+        else:
+            result = analyze_video(find_tool("ffmpeg"), joined, folder, wanted,
+                                   dovi_tool=find_tool("dovi_tool"), ffprobe=find_tool("ffprobe"),
+                                   profile="8.4", cancel_check=self._boundary,
+                                   progress=lambda percent: self.progress(70 + 0.1 * percent))
+            self.rpu_path = Path(result["rpu_path"])
+            self.manifest["dolby_analysis"] = result["report"]
+            self._stage_done("auto_rpu", check_cancel=False)
+        self._validate_rpu(wanted)
+
+    def _rpu_file(self):
+        return str(getattr(self, "rpu_path", None) or self.cfg["rpu"])
+
+    def _verify_final_rpu(self, video):
+        """Extract through a pipe: validate every final RPU without a second HEVC copy."""
+        from dolby_analysis import verify_rpu
+        folder = self.job_dir / "auto-dolby"
+        output = folder / "final-extracted.bin"
+        log_path = folder / "final-extraction.log"
+        output.unlink(missing_ok=True)
+        decoder = extractor = None
+        try:
+            with log_path.open("wb") as log:
+                decoder = subprocess.Popen([find_tool("ffmpeg"), "-nostdin", "-v", "error", "-i", str(video),
+                    "-map", "0:v:0", "-c:v", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", "-"],
+                    stdout=subprocess.PIPE, stderr=log, **_hidden())
+                extractor = subprocess.Popen([find_tool("dovi_tool"), "extract-rpu", "-i", "-", "-o", str(output)],
+                    stdin=decoder.stdout, stdout=log, stderr=log, **_hidden())
+                decoder.stdout.close()
+                while decoder.poll() is None or extractor.poll() is None:
+                    self._boundary()
+                    if log_path.stat().st_size > 8 * 1024 * 1024:
+                        raise PipelineError("最终杜比元数据提取日志超出限制")
+                    if extractor.poll() is not None and extractor.returncode != 0:
+                        break
+                    self._cancel.wait(0.05)
+                if decoder.poll() != 0 or extractor.poll() != 0:
+                    raise PipelineError("最终杜比元数据提取失败，未发布成片")
+            self.manifest["rpu_final_validation"] = verify_rpu(find_tool("dovi_tool"), output,
+                self.manifest["dolby_analysis"], cancel_check=self._boundary)
+        finally:
+            for process in (extractor, decoder):
+                if process is not None and process.poll() is None:
+                    process.terminate()
+                    try:
+                        process.wait(timeout=3)
+                    except subprocess.TimeoutExpired:
+                        process.kill()
+                        process.wait()
+            log_path.unlink(missing_ok=True)
 
     def _extract(self):
         self.stage("1/6 提取 SDR 工作帧", 1, 6)
@@ -407,8 +538,6 @@ class Pipeline:
         folder = self.job_dir / "interpolated"
         count = self.manifest["source_frames"]
         wanted = output_frame_count(count, self.source_rate, self.rate)
-        if self.cfg["color_mode"] in ("dv81", "dv84"):
-            self._validate_rpu(wanted)
         self.manifest["output_frames"] = wanted
         self.manifest["fps"] = str(self.rate)
         if "interpolate" not in self.manifest["completed"]:
@@ -432,7 +561,7 @@ class Pipeline:
         return folder if self.cfg["interp"] else source
 
     def _validate_rpu(self, wanted):
-        summary = self._run([find_tool("dovi_tool"), "info", "-i", self.cfg["rpu"], "-s"])
+        summary = self._run([find_tool("dovi_tool"), "info", "-i", self._rpu_file(), "-s"])
         match = re.search(r"Frames:\s*(\d+)", summary)
         if not match or int(match[1]) != wanted or not re.search(r"Profile:\s*8\b", summary):
             raise PipelineError("RPU 必须为 Profile 8，且帧数与最终视频完全一致")
@@ -448,7 +577,7 @@ class Pipeline:
             if len(curves) == 3 and all(identity(c) for c in curves):
                 raise PipelineError("该 RPU 使用已知的 PQ 恒等映射，不能直接用于此 HLG / 8.4 制作路线；请选择与 HLG 成片配套的元数据")
         digest = hashlib.sha256()
-        with Path(self.cfg["rpu"]).open("rb") as source:
+        with Path(self._rpu_file()).open("rb") as source:
             for block in iter(lambda: source.read(1024 * 1024), b""):
                 self._boundary()
                 digest.update(block)
@@ -463,7 +592,7 @@ class Pipeline:
         process = None
         try:
             with path.open("wb") as output:
-                process = subprocess.Popen([find_tool("dovi_tool"), "info", "-i", self.cfg["rpu"], "-f", "0"],
+                process = subprocess.Popen([find_tool("dovi_tool"), "info", "-i", self._rpu_file(), "-f", "0"],
                                            stdout=output, stderr=subprocess.STDOUT, **_hidden())
                 started = time.monotonic()
                 while process.poll() is None:
@@ -496,6 +625,7 @@ class Pipeline:
             vf += (",format=gbrpf32le,zscale=pin=bt709:tin=bt709:min=gbr:rin=full:"
                    "p=bt709:t=linear:m=gbr:r=full:npl=100,"
                    "zscale=pin=bt709:tin=linear:min=gbr:rin=full:p=bt2020:t=linear:m=gbr:r=full,"
+                   + self._remaster_filter("bt709") +
                    "zscale=pin=bt2020:tin=linear:min=gbr:rin=full:p=bt2020:"
                    f"t={transfer}:m=bt2020nc:r=limited:npl=100,format=yuv420p10le")
         else:
@@ -580,7 +710,7 @@ class Pipeline:
                        "-start_number", "1", "-i", encode_input / "%08d.png", "-frames:v", str(count),
                        "-vf", self._filters(), "-c:v", "libx265", "-preset", cfg.get("preset", "medium"),
                        "-crf", str(cfg.get("crf", 18)), "-pix_fmt", "yuv420p10le", "-x265-params", params,
-                       "-tag:v", "hvc1", "-video_track_timescale", str(self.rate.numerator), "-an", partial])
+                       "-tag:v", "hvc1", "-video_track_timescale", str(self.rate.numerator), "-an", partial], cwd=self.job_dir)
             self._validate_video(partial, count)
             self._boundary()
             os.replace(partial, output)
@@ -612,13 +742,14 @@ class Pipeline:
         if self.cfg["color_mode"] not in ("dv81", "dv84"):
             self.progress(82)
             return joined
+        self._ensure_rpu(joined)
         dv_video = self.job_dir / "dv.hevc"
         if "dv" not in self.manifest["completed"]:
             raw = self.job_dir / "base.hevc"
             self._run([find_tool("ffmpeg"), "-nostdin", "-v", "warning", "-y", "-i", joined,
                        "-map", "0:v:0", "-c", "copy", "-bsf:v", "hevc_mp4toannexb", raw])
             partial = self.job_dir / "dv.partial.hevc"
-            self._run([find_tool("dovi_tool"), "inject-rpu", "-i", raw, "--rpu-in", self.cfg["rpu"], "-o", partial])
+            self._run([find_tool("dovi_tool"), "inject-rpu", "-i", raw, "--rpu-in", self._rpu_file(), "-o", partial])
             if not partial.is_file() or not partial.stat().st_size:
                 raise PipelineError("杜比元数据注入未生成输出")
             os.replace(partial, dv_video)
@@ -704,6 +835,8 @@ class Pipeline:
             # successful mux alone does not prove there are no corrupt frames.
             self._run([find_tool("ffmpeg"), "-nostdin", "-v", "error", "-xerror", "-i", partial,
                        "-map", "0:v:0", "-map", "0:a:0?", "-f", "null", "-"])
+            if self.manifest.get("dolby_analysis"):
+                self._verify_final_rpu(partial)
             from quality import assess_bilibili
             media = self._inspect(partial)
             media["path"] = str(self.output)
@@ -724,6 +857,9 @@ class Pipeline:
                                 "decode_verified": True, "source": self.cfg["video"]}
             if self.manifest.get("rpu_validation"):
                 report["export"]["rpu_validation"] = self.manifest["rpu_validation"]
+            for key in ("hdr_remaster", "dolby_analysis", "rpu_final_validation"):
+                if self.manifest.get(key):
+                    report["export"][key] = self.manifest[key]
             if self.cfg["delivery"] == "bilibili" and report["status"] == "fail":
                 failures = [c["detail"] for c in report["checks"] if c["status"] == "fail"]
                 raise PipelineError("B站交付质检未通过：\n" + "\n".join(failures))
@@ -795,7 +931,9 @@ class Pipeline:
     def _native_filters(self):
         """Keep native precision until the final 10-bit quantization."""
         stream, mode = self.info["stream"], self.cfg["color_mode"]
-        transfer = stream.get("color_transfer")
+        transfer = stream.get("color_transfer") if self.cfg["source_transfer_override"] == "auto" else self.cfg["source_transfer_override"]
+        interpretation = ("explicit" if self.cfg["source_transfer_override"] != "auto" else
+                          "file" if transfer in ("smpte2084", "arib-std-b67", "bt709", "iec61966-2-1", "bt2020-10", "bt2020-12") else "assumed_bt709")
         transfer = transfer if transfer in ("smpte2084", "arib-std-b67", "bt709", "iec61966-2-1", "bt2020-10", "bt2020-12") else "bt709"
         hdr = transfer in ("smpte2084", "arib-std-b67")
         primaries = stream.get("color_primaries")
@@ -827,6 +965,8 @@ class Pipeline:
             filters += (f"scale={fitted_w}:{fitted_h}:flags=lanczos,setsar=1,"
                         f"pad={cfg['width']}:{cfg['height']}:(ow-iw)/2:(oh-ih)/2,")
         same_color = transfer == out_t and primaries == out_p and matrix == out_m
+        self.manifest["hdr_remaster"] = {"active": False, "source_transfer": transfer,
+                                        "reason": "HDR 源保持原动态范围" if hdr else "未启用 SDR 高光扩展"}
         if same_color and value_range == "limited":
             filters += "format=yuv420p10le"
         else:
@@ -834,8 +974,13 @@ class Pipeline:
                         f"p={primaries}:t=linear:m=gbr:r=full:npl=100,format=gbrpf32le,")
             if hdr and mode == "sdr":
                 filters += "tonemap=tonemap=mobius:param=0.3:desat=0.5,"
+            if mode != "sdr" and not hdr and cfg["hdr_remaster"] == "auto":
+                filters += (f"zscale=pin={primaries}:tin=linear:min=gbr:rin=full:"
+                            "p=bt2020:t=linear:m=gbr:r=full," + self._remaster_filter(transfer))
+                primaries = "bt2020"
             filters += (f"zscale=pin={primaries}:tin=linear:min=gbr:rin=full:"
                         f"p={out_p}:t={out_t}:m={out_m}:r=limited:npl=100:dither=error_diffusion,format=yuv420p10le")
+        self.manifest["hdr_remaster"]["source_transfer_interpretation"] = interpretation
         # Source RPU metadata must never follow regraded/resampled frames into
         # the encoder. Only explicitly supplied matching metadata is injected.
         if not same_color:
@@ -863,14 +1008,12 @@ class Pipeline:
                 help_text = self._run([find_tool("ffmpeg"), "-hide_banner", "-h", "encoder=libx265"])
                 if "-dolbyvision" in help_text:
                     cmd[-1:-1] = ["-dolbyvision", "0"]
-            self._run(cmd)
+            self._run(cmd, cwd=self.job_dir)
             data = self._validate_video(partial)
             video = next(s for s in data["streams"] if s["codec_type"] == "video")
             self.manifest["output_frames"] = int(video["nb_read_frames"])
             self.manifest["duration"] = self.manifest["output_frames"] / float(self.rate)
             self.manifest["fps"] = str(self.rate)
-            if mode in ("dv81", "dv84"):
-                self._validate_rpu(self.manifest["output_frames"])
             self._boundary()
             os.replace(partial, joined)
             self._stage_done("native")
@@ -927,7 +1070,7 @@ class Pipeline:
             if self.cfg["auto_clean"]:
                 # Keep manifest for traceability; remove only this job's artifacts.
                 for child in self.job_dir.iterdir():
-                    if child.name != "manifest.json":
+                    if child.name != "manifest.json" and not (child.name == "auto-dolby" and self.manifest.get("dolby_analysis")):
                         self._clean(child)
             self.progress(100)
             self.log(f"[完成] 已验证输出: {output}")

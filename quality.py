@@ -301,6 +301,7 @@ def inspect_media(path, *, ffprobe=None, mediainfo=None, count_frames=False, can
         command.append("-count_frames")
     command += ["-show_streams", "-show_format", "-of", "json", str(path)]
     info = read_probe(_run_json(command, timeout=None if count_frames else 90, cancel_event=cancel_event), path)
+    _complete_frame_colors(info, ffprobe, path, cancel_event)
     media_tool = mediainfo if mediainfo is not None else _tool("mediainfo")
     if media_tool and info["audio_codec"] in ("eac3", "truehd"):
         try:
@@ -312,6 +313,54 @@ def inspect_media(path, *, ffprobe=None, mediainfo=None, count_frames=False, can
             # but it must not silently turn an unknown Atmos stream into a pass.
             info["inspection_notes"].append(str(exc))
     return info
+
+
+def _complete_frame_colors(info, ffprobe, path, cancel_event):
+    """Fill omitted stream colors from this video's first decoded frame only.
+
+    Some demuxer/codec combinations expose HEVC VUI colors on decoded frames
+    while omitting them from show_streams. Never replace an explicit stream
+    value, inspect an attached picture, or infer HDR from editable track tags.
+    """
+    fields = ("color_transfer", "color_primaries", "color_space", "color_range")
+    def unknown(value):
+        return str(value or "").strip().lower() in ("", "unknown", "unspecified", "reserved", "n/a", "none")
+    stream = info["stream"]
+    missing = [key for key in fields if unknown(stream.get(key))]
+    if not missing:
+        return
+    index = _integer(stream.get("index"))
+    if index is None or index < 0:
+        info["inspection_notes"].append("视频轨道没有有效索引，未进行首帧色彩补充检测")
+        return
+    try:
+        # A small packet budget permits decoder reordering/B-frames. The
+        # absolute stream index is selected, so a cover image cannot take the
+        # place of the main video. No full-file frame scan is needed here.
+        data = _run_json([ffprobe, "-v", "error", "-select_streams", str(index),
+                          "-read_intervals", "%+#32", "-show_frames", "-show_entries",
+                          "frame=media_type,stream_index,color_transfer,color_primaries,color_space,color_range,chroma_location",
+                          "-of", "json", str(path)], timeout=30, cancel_event=cancel_event)
+    except QualityCancelled:
+        raise
+    except QualityError as exc:
+        info["inspection_notes"].append("首帧色彩补充检测失败：" + str(exc))
+        return
+    frame = next((item for item in data.get("frames", []) if isinstance(item, dict)
+                  and item.get("media_type") == "video" and _integer(item.get("stream_index")) == index), None)
+    if frame is None:
+        info["inspection_notes"].append("限定读取范围内没有可用视频帧，未推测缺失的色彩信息")
+        return
+    recovered = {}
+    for key in missing:
+        if not unknown(frame.get(key)):
+            stream[key] = info[key] = frame[key]
+            recovered[key] = frame[key]
+    if unknown(stream.get("chroma_location")) and not unknown(frame.get("chroma_location")):
+        stream["chroma_location"] = frame["chroma_location"]
+    if recovered:
+        info["decoded_frame_color"] = {"stream_index": index, "fields": recovered}
+        info["inspection_notes"].append("从实际解码首帧补充视频色彩信息：" + ", ".join(recovered))
 
 
 def _check(identifier, label, status, detail):

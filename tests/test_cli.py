@@ -1,11 +1,14 @@
 """User-facing CLI regressions using real child processes and encoded media."""
 import json
+import contextlib
+import io
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from fractions import Fraction
 from pathlib import Path
 
@@ -13,6 +16,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
+try:
+    from pipeline import find_tool
+    DOVI = find_tool("dovi_tool")
+except FileNotFoundError:
+    DOVI = None
 
 
 def run_command(args, timeout=60):
@@ -160,6 +168,52 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertFalse(self.output.exists())
         self.assertEqual(video_hash(self.source), original)
 
+    @unittest.skipUnless(DOVI, "dovi_tool required for automatic Dolby export")
+    def test_auto_dolby_creates_real_dv84_then_preserves_a_compliant_result(self):
+        result = self.cli("--auto-dolby", "--preset", "ultrafast")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout[-3000:])
+        from quality import inspect_media
+        generated = inspect_media(self.output, count_frames=True)
+        self.assertEqual((generated["dv_profile"], generated["dv_compatibility"]), (8, 4))
+        self.assertTrue(generated["dv_rpu_present"] and generated["dv_bl_present"])
+        self.assertEqual(generated["color_transfer"], "arib-std-b67")
+        self.assertEqual(generated["bit_depth"], 10)
+        self.assertEqual(Fraction(generated["fps_fraction"]), Fraction(30000, 1001))
+        self.assertEqual(generated["total_frames"], 6)
+        self.assertEqual((generated["width"], generated["height"]), (96, 64))
+        report = json.loads(Path(str(self.output) + ".quality.json").read_text(encoding="utf-8"))
+        self.assertFalse(report["platform_verified"])
+        self.assertEqual(report["export"]["route"], "transcode")
+        self.source, self.output = self.output, self.root / "preserved Dolby.mp4"
+        # A separate workspace models the next job rather than resuming the
+        # newly generated one. The shortcut must preserve compliant payloads.
+        self.workspace = self.root / "second workspace"
+        result = self.cli("--auto-dolby")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout[-2000:])
+        self.assertEqual(video_hash(self.source), video_hash(self.output))
+        self.source, self.output = self.output, self.root / "explicit HLG remake.mp4"
+        self.workspace = self.root / "source interpretation workspace"
+        result = self.cli("--auto-dolby", "--source-transfer", "arib-std-b67", "--preset", "ultrafast")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout[-2000:])
+        report = json.loads(Path(str(self.output) + ".quality.json").read_text(encoding="utf-8"))
+        self.assertEqual(report["export"]["route"], "transcode", "explicit source interpretation was sent to incompatible preservation")
+        remade = inspect_media(self.output)
+        self.assertEqual((remade["dv_profile"], remade["dv_compatibility"]), (8, 4))
+
+    def test_automatic_dolby_options_reject_explicit_conflicts_before_output(self):
+        cases = [("--auto-dolby", "--route", "preserve"),
+                 ("--auto-dolby", "--color", "hlg"),
+                 ("--auto-dolby", "--delivery", "general"),
+                 ("--route", "transcode", "--color", "dv84", "--rpu", "manual.bin", "--rpu-mode", "auto"),
+                 ("--route", "transcode", "--color", "dv81"),
+                 ("--rpu-mode", "external"),
+                 ("--hdr-peak-nits", "1001")]
+        for arguments in cases:
+            with self.subTest(arguments=arguments):
+                result = self.cli(*arguments)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(self.output.exists())
+
     @unittest.skipUnless(os.environ.get("DOLBY_ATMOS_FIXTURE"), "set DOLBY_ATMOS_FIXTURE for native JOC audio")
     def test_external_raw_atmos_audio_is_supported_without_a_video_track(self):
         audio = Path(os.environ["DOLBY_ATMOS_FIXTURE"]).resolve()
@@ -169,6 +223,68 @@ class CliIntegrationTests(unittest.TestCase):
         report = json.loads(Path(str(self.output) + ".quality.json").read_text(encoding="utf-8"))
         self.assertEqual(report["media"]["atmos"], "confirmed")
         self.assertEqual(report["media"]["audio_codec"], "eac3")
+
+
+class CliConfigurationTests(unittest.TestCase):
+    """Inspect parser-to-engine contracts without encoding an 8K fixture."""
+
+    def invoke(self, options, source=None, checkpoint=None):
+        import cli
+        cfgs = []
+        class Runner:
+            def __init__(self, cfg, **_):
+                cfgs.append(cfg)
+            def run(self):
+                return "configuration inspected"
+        info = {"width": 1920, "height": 1080, "display_width": 1920, "display_height": 1080,
+                "fps": 30, "fps_fraction": "30", "audio_codec": "aac"} | (source or {})
+        with patch("cli.Pipeline", Runner), patch("cli.signal.signal"), patch("cli.load_checkpoint", return_value=checkpoint), \
+             patch("quality.inspect_media", return_value=info), patch("quality.assess_bilibili", return_value={"status": "fail"}), \
+             contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(cli.main(options), 0)
+        return cfgs[0]
+
+    def test_general_defaults_do_not_inject_new_dolby_options(self):
+        cfg = self.invoke(["-i", "source.mp4"])
+        self.assertEqual(cfg["route"], "preserve")
+        for key in ("rpu_mode", "hdr_remaster", "hdr_peak_nits", "source_transfer_override"):
+            self.assertNotIn(key, cfg)
+
+    def test_auto_dolby_caps_native_size_and_fps_without_ai(self):
+        cfg = self.invoke(["-i", "source.mp4", "--auto-dolby"],
+                          {"width": 7680, "height": 4320, "display_width": 7680, "display_height": 4320,
+                           "fps": 120, "fps_fraction": "120"})
+        self.assertEqual((cfg["width"], cfg["height"]), (3840, 2160))
+        self.assertEqual(cfg["fps_override"], "60")
+        self.assertEqual((cfg["route"], cfg["delivery"], cfg["color_mode"], cfg["rpu_mode"]),
+                         ("transcode", "bilibili", "dv84", "auto"))
+        self.assertFalse(cfg["ai"] or cfg["interp"])
+
+    def test_manual_rpu_and_explicit_hdr_controls_reach_engine(self):
+        cfg = self.invoke(["-i", "source.mp4", "--route", "transcode", "--color", "dv84",
+                           "--rpu", "matching.bin", "--hdr-remaster", "off", "--hdr-peak-nits", "800"])
+        self.assertEqual(cfg["rpu_mode"], "external")
+        self.assertEqual(cfg["rpu"], "matching.bin")
+        self.assertEqual((cfg["hdr_remaster"], cfg["hdr_peak_nits"]), ("off", 800))
+
+    def test_resume_uses_original_automatic_metadata_and_unknown_options(self):
+        original = {"video": "source.mp4", "route": "transcode", "rpu_mode": "auto", "hdr_remaster": "off",
+                    "hdr_peak_nits": 800, "source_transfer_override": "arib-std-b67", "future_option": "must remain"}
+        cfg = self.invoke(["--resume", "--workspace", "checkpoint-dir"], checkpoint={"cfg": original})
+        self.assertEqual(cfg, dict(original, resume=True))
+
+    def test_unresolved_bt2020_requires_source_transfer_and_override_reaches_engine(self):
+        source = {"color_transfer": "unknown", "color_primaries": "bt2020", "color_space": "bt2020nc"}
+        with self.assertRaises(SystemExit) as error:
+            self.invoke(["-i", "source.mp4", "--auto-dolby"], source)
+        self.assertEqual(error.exception.code, 2)
+        cfg = self.invoke(["-i", "source.mp4", "--auto-dolby", "--source-transfer", "arib-std-b67"], source)
+        self.assertEqual(cfg["source_transfer_override"], "arib-std-b67")
+        # Original bitstream preservation does not interpret or alter pixels.
+        self.assertEqual(self.invoke(["-i", "source.mp4"], source)["route"], "preserve")
+        with self.assertRaises(SystemExit) as error:
+            self.invoke(["-i", "source.mp4", "--source-transfer", "smpte2084"], source)
+        self.assertEqual(error.exception.code, 2)
 
 
 if __name__ == "__main__":
