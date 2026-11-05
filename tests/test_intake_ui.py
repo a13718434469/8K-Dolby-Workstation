@@ -256,6 +256,17 @@ def picture_settings(w):
     }
 
 
+def toggle_checkbox_with_space(checkbox):
+    assert checkbox.isVisible() and checkbox.isEnabled(), 'checkbox is not available to the user'
+    before = checkbox.isChecked()
+    checkbox.setFocus()
+    # A stretched QCheckBox may have its center outside the indicator/text hit
+    # area on another desktop font. Space activates the focused real control.
+    QTest.keyClick(checkbox, Qt.Key_Space)
+    QApplication.processEvents()
+    assert checkbox.isChecked() != before, 'focused checkbox ignored the user Space key'
+
+
 def same_source_keeps_manual_picture_settings(w):
     w.load_whole()
     QTest.mouseClick(w.advanced_toggle, Qt.LeftButton)
@@ -266,10 +277,10 @@ def same_source_keeps_manual_picture_settings(w):
     for preset in ('quality', 'enhance'):
         choose_combo_with_keys(w.export_preset, preset)
         if preset == 'enhance':
-            assert w.ai.isChecked() and w.interp.isChecked()
-            QTest.mouseClick(w.ai, Qt.LeftButton)
-            QTest.mouseClick(w.interp, Qt.LeftButton)
-            assert not w.ai.isChecked() and not w.interp.isChecked()
+            assert w.ai.isChecked() and w.interp.isChecked(), 'enhance preset did not enable the available tools'
+            toggle_checkbox_with_space(w.ai)
+            toggle_checkbox_with_space(w.interp)
+            assert not w.ai.isChecked() and not w.interp.isChecked(), 'manual enhancement selections did not turn off'
         choose_combo_with_keys(w.resolution, (1920, 1080))
         choose_combo_with_keys(w.fps, 24)
         choose_combo_with_keys(w.color, 'hlg')
@@ -291,8 +302,8 @@ def restored_picture_survives_inspection(w):
     w.sr_available = w.interp_available = True
     QTest.mouseClick(w.advanced_toggle, Qt.LeftButton)
     choose_combo_with_keys(w.export_preset, 'enhance')
-    assert w.ai.isChecked() and w.interp.isChecked()
-    QTest.mouseClick(w.interp, Qt.LeftButton)
+    assert w.ai.isChecked() and w.interp.isChecked(), 'enhance preset did not enable the available tools'
+    toggle_checkbox_with_space(w.interp)
     for combo, value in ((w.resolution, (1920, 1080)), (w.fps, 48),
                          (w.color, 'hlg'), (w.audio_mode, 'aac'),
                          (w.model, 'realesr-animevideov3'), (w.encoding_preset, 'fast')):
