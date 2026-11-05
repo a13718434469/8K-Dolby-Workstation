@@ -8,20 +8,20 @@ import json
 from pathlib import Path
 
 import PyQt5
-from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal, QUrl
-from PyQt5.QtGui import QDesktopServices
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal, QUrl, QEvent
+from PyQt5.QtGui import QDesktopServices, QKeySequence, QFont
 from PyQt5.QtWidgets import (
     QApplication, QCheckBox, QComboBox, QFileDialog, QGridLayout, QGroupBox,
     QHBoxLayout, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QVBoxLayout, QWidget, QFrame, QScrollArea,
-    QToolButton, QSpinBox,
+    QToolButton, QSpinBox, QShortcut, QStyle,
 )
 from pipeline import (
     BASE_DIR, CHECKPOINT_FILE, TOOLS_DIR, WORKSPACE, Pipeline, PipelineCancelled, estimate_disk,
     find_rife_model, find_tool, load_checkpoint, probe_video,
 )
 
-VERSION = "2.1"
+VERSION = "2.2"
 
 
 def ai_tools_available():
@@ -63,21 +63,24 @@ class SafeComboBox(QComboBox):
 class FileField(QWidget):
     """A local-file field accepting both browsing and drag/drop."""
     changed = pyqtSignal(str)
+    files_selected = pyqtSignal(object)
 
     def __init__(self, placeholder, file_filter, parent=None):
         super().__init__(parent)
         self.file_filter = file_filter
+        self.import_target = None
         self.setAcceptDrops(True)
         row = QHBoxLayout(self)
         row.setContentsMargins(0, 0, 0, 0)
         self.edit = QLineEdit()
+        self.edit.setAcceptDrops(False)
         self.edit.setPlaceholderText(placeholder)
         self.edit.setClearButtonEnabled(True)
         self.edit.textChanged.connect(self.changed)
-        button = QPushButton("浏览…")
-        button.clicked.connect(self.browse)
+        self.browse_button = QPushButton("选择…")
+        self.browse_button.clicked.connect(self.browse)
         row.addWidget(self.edit, 1)
-        row.addWidget(button)
+        row.addWidget(self.browse_button)
 
     @property
     def filepath(self):
@@ -85,22 +88,104 @@ class FileField(QWidget):
 
     def set_file(self, path):
         self.edit.setText(str(path))
+        self.edit.setToolTip(str(path))
 
     def browse(self):
         path, _ = QFileDialog.getOpenFileName(self, "选择文件", "", self.file_filter)
         if path:
-            self.set_file(path)
+            if self.import_target:
+                self.files_selected.emit([path])
+            else:
+                self.set_file(path)
 
     def dragEnterEvent(self, event):
         urls = event.mimeData().urls()
-        if urls and urls[0].isLocalFile():
+        if self.isEnabled() and urls and all(url.isLocalFile() for url in urls):
             event.acceptProposedAction()
 
     def dropEvent(self, event):
         urls = event.mimeData().urls()
-        if urls and urls[0].isLocalFile() and Path(urls[0].toLocalFile()).is_file():
-            self.set_file(urls[0].toLocalFile())
+        if not self.isEnabled():
+            event.ignore()
+            return
+        paths = [url.toLocalFile() for url in urls if url.isLocalFile()]
+        if self.import_target and paths:
+            self.files_selected.emit(paths)
             event.acceptProposedAction()
+        elif len(paths) == 1 and Path(paths[0]).is_file():
+            if "*.bin" in self.file_filter and Path(paths[0]).suffix.lower() != ".bin":
+                self.files_selected.emit(paths)
+            else:
+                self.set_file(paths[0])
+            event.acceptProposedAction()
+
+
+class MediaDropArea(QFrame):
+    files_dropped = pyqtSignal(object)
+    browse_requested = pyqtSignal()
+
+    def __init__(self):
+        super().__init__()
+        self.setAcceptDrops(True)
+        self.setObjectName("dropArea")
+
+    def dragEnterEvent(self, event):
+        if self.isEnabled() and event.mimeData().hasUrls() and all(url.isLocalFile() for url in event.mimeData().urls()):
+            event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        if not self.isEnabled():
+            event.ignore()
+            return
+        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        if paths:
+            self.files_dropped.emit(paths)
+            event.acceptProposedAction()
+
+    def mouseDoubleClickEvent(self, event):
+        if self.isEnabled() and event.button() == Qt.LeftButton:
+            self.browse_requested.emit()
+
+
+class IntakeThread(QThread):
+    result = pyqtSignal(object, str)
+
+    def __init__(self, paths, target):
+        super().__init__()
+        self.paths = list(paths)
+        self.target = target
+        self.cancelled = threading.Event()
+
+    def request_stop(self):
+        self.cancelled.set()
+
+    def run(self):
+        collected = []
+        try:
+            from quality import inspect_media, inspect_audio
+            for raw in self.paths:
+                if self.cancelled.is_set():
+                    return
+                path = Path(raw).resolve()
+                if not path.is_file():
+                    raise ValueError(f"文件不存在或不是普通文件：{path.name}")
+                try:
+                    info = inspect_media(path, cancel_event=self.cancelled)
+                    kind = "video"
+                except Exception as video_error:
+                    if self.cancelled.is_set():
+                        return
+                    try:
+                        info = inspect_audio(path, cancel_event=self.cancelled)
+                        kind = "audio"
+                    except Exception:
+                        raise ValueError(f"无法读取媒体文件：{path.name}。当前素材保持不变。") from video_error
+                collected.append({"path": str(path), "kind": kind, "info": info})
+            if not self.cancelled.is_set():
+                self.result.emit(collected, "")
+        except Exception as exc:
+            if not self.cancelled.is_set():
+                self.result.emit([], str(exc))
 
 
 class ProbeThread(QThread):
@@ -169,19 +254,31 @@ class ProcessThread(QThread):
 
 class MainWindow(QMainWindow):
     PRESETS = {
+        "preserve": ("保持原画质（推荐）", "不重编码视频，保持原始分辨率、帧率和色彩。"),
         "bili_preserve": ("B站杜比 · 保留原片", "保留已有 Dolby Vision 8.4 与原始码流。优先保障画质，有现成 Atmos 就原样保留。"),
         "bili_make": ("B站杜比 · HLG / 8.4 制作", "输出 HLG / Dolby Vision 8.4。需要与最终画面、时序匹配的 8.4 RPU；导出后生成本地质检报告。"),
         "quality": ("高质量常规导出", "原生精度处理，默认保留源分辨率和帧率。适合 SDR、HDR10 与 HLG 内容制作。"),
         "enhance": ("AI 增强 · 插帧与超分", "按需启用 AI。此路径使用 8-bit SDR RGB 工作帧；HDR 母版推荐选择原片保留或高质量导出。"),
     }
 
+    intake_finished = pyqtSignal(bool, str)
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"Dolby Workstation · v{VERSION}")
-        self.resize(1280, 900)
-        self.setMinimumSize(1000, 640)
+        self.setWindowTitle(f"杜比工作站 · v{VERSION}")
+        self.resize(1180, 780)
+        self.setMinimumSize(900, 600)
+        self.setAcceptDrops(True)
+        try:
+            from app_identity import app_icon
+            self.setWindowIcon(app_icon())
+        except ImportError:
+            pass
         self.worker = None
         self.probes = set()
+        self.intakes = set()
+        self.intake_busy = False
+        self.ainfo = None
         self.vinfo = None
         self.outcome = None
         self.last_output = None
@@ -190,284 +287,334 @@ class MainWindow(QMainWindow):
         self.started_at = 0
         self.current_progress = 0
         self.restore_in_progress = False
+        self._intake_committing = False
+        self._preset_explicit = False
+        self._programmatic_output = False
+        self._output_user_modified = False
+        self._audio_mode_explicit = False
+        self._setting_audio_mode = False
+        self._preserve_restored_settings = False
+        self._smart_native_conversion = False
         self.settings_file = WORKSPACE / "ui_preferences.json"
         self.sr_available, self.interp_available = ai_tools_available()
         self.setStyleSheet(self.stylesheet())
         root = QWidget()
         self.setCentralWidget(root)
         shell = QVBoxLayout(root)
-        shell.setContentsMargins(22, 18, 22, 18)
-        shell.setSpacing(16)
+        shell.setContentsMargins(20, 14, 20, 14)
+        shell.setSpacing(12)
 
-        heading = QHBoxLayout()
-        brand = QVBoxLayout()
-        title = QLabel("DOLBY WORKSTATION")
-        title.setObjectName("brand")
-        brand.addWidget(title)
-        subtitle = QLabel("从素材检查到交付质检，让每一步都有依据")
-        subtitle.setObjectName("muted")
-        brand.addWidget(subtitle)
-        heading.addLayout(brand)
-        heading.addStretch()
-        self.top_status = QLabel("准备就绪")
-        self.top_status.setObjectName("statusPill")
-        heading.addWidget(self.top_status)
-        shell.addLayout(heading)
-
-        body = QHBoxLayout()
-        body.setSpacing(18)
-        sidebar = QFrame()
-        sidebar.setObjectName("sidebar")
-        sidebar.setMinimumWidth(185)
-        side = QVBoxLayout(sidebar)
-        side.setContentsMargins(17, 20, 17, 20)
-        label = QLabel("交付工作流")
-        label.setObjectName("eyebrow")
-        side.addWidget(label)
-        self.step_labels = []
-        for number, name, detail in [("01", "检查素材", "识别 HDR、杜比与音轨"),
-                                      ("02", "选择交付", "原片保留或高质量制作"),
-                                      ("03", "处理与质检", "检查码流、时序和元数据"),
-                                      ("04", "平台验收", "草稿转码后确认杜比")]:
-            step = QLabel(f"<b>{number}　{name}</b><br><span style='color:#8c99ad;font-size:11px'>{detail}</span>")
-            step.setWordWrap(True)
-            step.setMinimumHeight(63)
-            side.addWidget(step)
-            self.step_labels.append(step)
-        side.addStretch()
-        note = QLabel("画质优先\n已有 Atmos 音轨可保留\n\n本地格式合格后，仍需平台草稿验收确认识别结果。")
-        note.setWordWrap(True)
-        note.setObjectName("muted")
-        side.addWidget(note)
-        self.tool_label = QLabel("工具环境待检查")
-        self.tool_label.setWordWrap(True)
-        self.tool_label.setObjectName("muted")
-        side.addWidget(self.tool_label)
-        self.check_tools = QPushButton("检查工具环境")
+        toolbar = QHBoxLayout()
+        name = QLabel("杜比工作站")
+        name.setObjectName("appName")
+        try:
+            from app_identity import app_icon
+            icon_label = QLabel()
+            icon_label.setPixmap(app_icon().pixmap(24, 24))
+            toolbar.addWidget(icon_label)
+        except ImportError:
+            pass
+        toolbar.addWidget(name)
+        self.import_button = QPushButton("添加文件…")
+        self.import_button.setToolTip("选择视频，或同时选择视频和音频（Ctrl+O）")
+        self.import_button.clicked.connect(self.choose_media)
+        toolbar.addWidget(self.import_button)
+        self.check_tools = QPushButton("工具检查")
         self.check_tools.clicked.connect(self.check_environment)
-        side.addWidget(self.check_tools)
-        sidebar_area = QScrollArea()
-        sidebar_area.setWidgetResizable(True)
-        sidebar_area.setFrameShape(QFrame.NoFrame)
-        sidebar_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        sidebar_area.setFixedWidth(205)
-        sidebar_area.setWidget(sidebar)
-        body.addWidget(sidebar_area)
+        toolbar.addStretch()
+        self.top_status = QLabel("等待添加视频")
+        self.top_status.setObjectName("muted")
+        toolbar.addWidget(self.top_status)
+        self.window_toggle = QPushButton("还原窗口")
+        self.window_toggle.clicked.connect(self.toggle_window_state)
+        self.window_toggle.setToolTip("在普通窗口和最大化窗口之间切换")
+        toolbar.addWidget(self.window_toggle)
+        shell.addLayout(toolbar)
 
-        scroll = QScrollArea()
-        self.content_scroll = scroll
-        scroll.setWidgetResizable(True)
-        scroll.setFrameShape(QFrame.NoFrame)
+        self.notification = QLabel("视频可自带音轨，也可以把视频和音频一起拖入。")
+        self.notification.setObjectName("notification")
+        self.notification.setWordWrap(True)
+        shell.addWidget(self.notification)
+        self.content_scroll = QScrollArea()
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setFrameShape(QFrame.NoFrame)
         content = QWidget()
-        content.setObjectName("content")
         stack = QVBoxLayout(content)
-        stack.setContentsMargins(0, 0, 5, 0)
-        stack.setSpacing(14)
-        scroll.setWidget(content)
-        body.addWidget(scroll, 1)
-        shell.addLayout(body, 1)
+        stack.setContentsMargins(0, 0, 3, 0)
+        stack.setSpacing(10)
+        self.content_scroll.setWidget(content)
+        shell.addWidget(self.content_scroll, 1)
+        workspace_row = QHBoxLayout()
+        workspace_row.setSpacing(16)
 
-        self.input_group = QGroupBox("01   素材与输出")
-        grid = QGridLayout(self.input_group)
-        grid.setHorizontalSpacing(12)
-        grid.setVerticalSpacing(11)
-        self.video = FileField("选择或拖入视频文件", "视频 (*.mp4 *.mkv *.mov *.avi *.webm *.m4v);;所有文件 (*)")
-        self.audio = FileField("可选：已有 Atmos / 其他替换音轨", "音频/视频 (*.flac *.wav *.mp3 *.aac *.ac3 *.eac3 *.m4a *.mp4 *.mkv);;所有文件 (*)")
-        self.output = QLineEdit()
-        self.output.setPlaceholderText("选择新的 MP4 输出文件")
-        output_button = QPushButton("另存为…")
-        output_button.clicked.connect(self.choose_output)
-        grid.addWidget(QLabel("视频素材"), 0, 0)
-        grid.addWidget(self.video, 0, 1, 1, 2)
-        grid.addWidget(QLabel("输出文件"), 1, 0)
-        grid.addWidget(self.output, 1, 1)
-        grid.addWidget(output_button, 1, 2)
-        self.info_label = QLabel("导入后自动识别分辨率、帧率、动态范围与音轨。")
-        self.info_label.setObjectName("muted")
+        self.input_group = MediaDropArea()
+        self.input_group.files_dropped.connect(lambda paths: self.import_files(paths, "auto"))
+        self.input_group.browse_requested.connect(self.choose_media)
+        sources = QVBoxLayout(self.input_group)
+        sources.setContentsMargins(24, 24, 24, 20)
+        sources.setSpacing(12)
+        sources.addStretch(1)
+        self.drop_title = QLabel("将视频拖到这里")
+        self.drop_title.setAlignment(Qt.AlignCenter)
+        self.drop_title.setObjectName("dropTitle")
+        self.drop_title.setWordWrap(True)
+        sources.addWidget(self.drop_title)
+        self.drop_hint = QLabel("或点击上方“添加文件”\n支持整片导入、音频先导入、视频与音频同时导入")
+        self.drop_hint.setAlignment(Qt.AlignCenter)
+        self.drop_hint.setObjectName("muted")
+        self.drop_hint.setWordWrap(True)
+        sources.addWidget(self.drop_hint)
+        self.info_label = QLabel()
         self.info_label.setWordWrap(True)
-        grid.addWidget(self.info_label, 2, 0, 1, 3)
-        metrics = QHBoxLayout()
-        self.source_video = self.make_metric("画面规格", "等待素材")
-        self.source_dv = self.make_metric("杜比视界", "尚未检测")
-        self.source_audio = self.make_metric("源音轨 / Atmos", "尚未检测")
-        for card in (self.source_video, self.source_dv, self.source_audio):
-            metrics.addWidget(card[0])
-        grid.addLayout(metrics, 3, 0, 1, 3)
-        stack.addWidget(self.input_group)
+        self.info_label.setAlignment(Qt.AlignCenter)
+        self.info_label.setObjectName("muted")
+        sources.addWidget(self.info_label)
+        self.play_source = QPushButton("查看原片")
+        self.play_source.setIcon(self.style().standardIcon(QStyle.SP_MediaPlay))
+        self.play_source.clicked.connect(self.open_source)
+        self.play_source.hide()
+        sources.addWidget(self.play_source, 0, Qt.AlignHCenter)
+        sources.addStretch(1)
+        fields = QGridLayout()
+        fields.setHorizontalSpacing(10)
+        fields.setVerticalSpacing(10)
+        self.video = FileField("尚未选择视频", "视频 (*.mp4 *.mkv *.mov *.m4v *.avi *.webm *.ts *.m2ts *.mxf);;所有文件 (*)")
+        self.audio = FileField("使用视频自带音轨", "音频或含音轨的视频 (*.wav *.flac *.mp3 *.aac *.m4a *.eac3 *.ac3 *.mp4 *.mkv *.mov *.mka *.opus *.ogg);;所有文件 (*)")
+        self.video.import_target = "video"
+        self.audio.import_target = "audio"
+        self.video.edit.setReadOnly(True)
+        self.audio.edit.setReadOnly(True)
+        self.video.edit.setClearButtonEnabled(False)
+        self.audio.edit.setClearButtonEnabled(False)
+        self.video.files_selected.connect(lambda paths: self.import_files(paths, "video"))
+        self.audio.files_selected.connect(lambda paths: self.import_files(paths, "audio"))
+        self.audio.browse_button.setText("选择音频…")
+        self.audio_clear = QPushButton("使用原音")
+        self.original_audio = self.audio_clear
+        self.audio_clear.setToolTip("移除替换音频，恢复视频自带的音轨")
+        self.audio_clear.clicked.connect(self.restore_original_audio)
+        self.audio_clear.setEnabled(False)
+        fields.addWidget(QLabel("视频"), 0, 0)
+        fields.addWidget(self.video, 0, 1, 1, 2)
+        fields.addWidget(QLabel("音轨"), 1, 0)
+        fields.addWidget(self.audio, 1, 1)
+        fields.addWidget(self.audio_clear, 1, 2)
+        sources.addLayout(fields)
+        self.audio_hint = QLabel("未替换音频时，直接使用视频原音。")
+        self.audio_hint.setObjectName("muted")
+        self.audio_hint.setWordWrap(True)
+        sources.addWidget(self.audio_hint)
+        workspace_row.addWidget(self.input_group, 3)
 
-        self.param_group = QGroupBox("02   交付方案")
-        settings = QVBoxLayout(self.param_group)
-        preset_row = QHBoxLayout()
+        self.param_group = QGroupBox("自动处理")
+        self.param_group.setMinimumWidth(320)
+        self.param_group.setMaximumWidth(440)
+        export = QVBoxLayout(self.param_group)
+        export.setContentsMargins(16, 22, 16, 16)
+        export.setSpacing(10)
         self.export_preset = SafeComboBox()
         for key, (label, _) in self.PRESETS.items():
             self.export_preset.addItem(label, key)
-        preset_row.addWidget(QLabel("使用方案"))
-        preset_row.addWidget(self.export_preset, 1)
-        self.preflight = QPushButton("检查交付条件")
-        self.preflight.clicked.connect(self.run_preflight)
-        preset_row.addWidget(self.preflight)
-        settings.addLayout(preset_row)
+        self.automatic_summary = QLabel("添加视频后自动检查格式。\n通常无需调整设置，直接开始处理。")
+        self.smart_summary = self.automatic_summary
+        self.automatic_summary.setObjectName("automaticSummary")
+        self.automatic_summary.setWordWrap(True)
+        export.addWidget(self.automatic_summary)
         self.preset_note = QLabel()
-        self.preset_note.setObjectName("notice")
+        self.preset_note.setObjectName("muted")
         self.preset_note.setWordWrap(True)
-        settings.addWidget(self.preset_note)
-
-        form = QGridLayout()
-        form.setHorizontalSpacing(12)
-        form.setVerticalSpacing(10)
         self.resolution = SafeComboBox()
-        for label, value in [("保留源分辨率", (0, 0)), ("1080p · 1920 × 1080", (1920, 1080)),
+        for label, value in [("保持源分辨率", (0, 0)), ("1080p · 1920 × 1080", (1920, 1080)),
                              ("4K · 3840 × 2160", (3840, 2160)), ("8K · 7680 × 4320", (7680, 4320)),
                              ("竖屏 4K · 2160 × 3840", (2160, 3840))]:
             self.resolution.addItem(label, value)
         self.fps = SafeComboBox()
-        for label, value in [("保留源帧率", 0), ("24 fps", 24), ("30 fps", 30), ("48 fps", 48), ("60 fps", 60), ("120 fps", 120)]:
+        for label, value in [("保持源帧率", 0), ("24 fps", 24), ("30 fps", 30), ("48 fps", 48), ("60 fps", 60), ("120 fps", 120)]:
             self.fps.addItem(label, value)
+        compact = QGridLayout()
+        compact.addWidget(QLabel("尺寸"), 0, 0)
+        compact.addWidget(self.resolution, 0, 1)
+        compact.addWidget(QLabel("帧率"), 1, 0)
+        compact.addWidget(self.fps, 1, 1)
+        export.addStretch()
+        export.addWidget(QLabel("保存到"))
+        self.output = QLineEdit()
+        self.output.setAcceptDrops(False)
+        self.output.setPlaceholderText("导入视频后自动生成文件名")
+        self.output.textEdited.connect(self.output_edited)
+        output_row = QHBoxLayout()
+        output_row.addWidget(self.output, 1)
+        output_button = QPushButton("更改…")
+        output_button.clicked.connect(self.choose_output)
+        output_row.addWidget(output_button)
+        export.addLayout(output_row)
+        self.preflight = QPushButton("检查格式")
+        self.preflight.clicked.connect(self.run_preflight)
+        workspace_row.addWidget(self.param_group, 2)
+        stack.addLayout(workspace_row, 1)
+
+        detail_links = QHBoxLayout()
+        self.advanced_toggle = QToolButton()
+        self.advanced_toggle.setText("调整设置")
+        self.advanced_toggle.setCheckable(True)
+        self.advanced_toggle.setArrowType(Qt.RightArrow)
+        self.advanced_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        detail_links.addWidget(self.advanced_toggle)
+        self.quality_toggle = QToolButton()
+        self.quality_toggle.setText("格式检查详情")
+        self.quality_toggle.setCheckable(True)
+        self.quality_toggle.setArrowType(Qt.RightArrow)
+        self.quality_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        detail_links.addWidget(self.quality_toggle)
+        self.log_toggle = QToolButton()
+        self.log_toggle.setText("日志")
+        self.log_toggle.setCheckable(True)
+        self.log_toggle.setArrowType(Qt.RightArrow)
+        self.log_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        detail_links.addWidget(self.log_toggle)
+        detail_links.addStretch()
+        self.tool_label = QLabel()
+        self.tool_label.setObjectName("muted")
+        stack.addLayout(detail_links)
+
+        self.advanced = QGroupBox("调整设置")
+        adjustment_layout = QVBoxLayout(self.advanced)
+        preset_row = QHBoxLayout()
+        preset_row.addWidget(QLabel("处理方式"))
+        preset_row.addWidget(self.export_preset, 1)
+        adjustment_layout.addLayout(preset_row)
+        adjustment_layout.addWidget(self.preset_note)
+        adjustment_layout.addLayout(compact)
+        advanced = QGridLayout()
+        adjustment_layout.addLayout(advanced)
+        advanced.setHorizontalSpacing(12)
+        advanced.setVerticalSpacing(9)
         self.color = SafeComboBox()
-        for label, value in [("SDR · BT.709", "sdr"), ("HDR10 · BT.2020 / PQ", "hdr10"),
-                             ("HLG · BT.2020", "hlg"), ("Dolby Vision 8.4 · HLG", "dv84"),
-                             ("Dolby Vision 8.1 · PQ", "dv81")]:
+        for label, value in [("SDR · BT.709", "sdr"), ("HDR10 · PQ", "hdr10"), ("HLG", "hlg"),
+                             ("杜比视界 8.4 · HLG", "dv84"), ("杜比视界 8.1 · PQ", "dv81")]:
             self.color.addItem(label, value)
         self.audio_mode = SafeComboBox()
-        for label, value in [("复制原音轨 · 保留已有 Atmos", "copy"), ("AAC · 通用兼容", "aac"),
-                             ("E-AC-3 · 普通多声道", "eac3"), ("无音轨", "none")]:
+        for label, value in [("复制音轨（保留已有 Atmos）", "copy"), ("AAC", "aac"), ("E-AC-3（普通多声道）", "eac3"), ("不保留音轨", "none")]:
             self.audio_mode.addItem(label, value)
-        form.addWidget(QLabel("目标尺寸"), 0, 0)
-        form.addWidget(self.resolution, 0, 1)
-        form.addWidget(QLabel("目标帧率"), 0, 2)
-        form.addWidget(self.fps, 0, 3)
-        form.addWidget(QLabel("画面格式"), 1, 0)
-        form.addWidget(self.color, 1, 1)
-        form.addWidget(QLabel("音频处理"), 1, 2)
-        form.addWidget(self.audio_mode, 1, 3)
-        self.rpu = FileField("与最终画面及时序配套的 RPU.bin", "RPU 元数据 (*.bin);;所有文件 (*)")
-        self.rpu_label = QLabel("杜比元数据")
-        form.addWidget(self.rpu_label, 2, 0)
-        form.addWidget(self.rpu, 2, 1, 1, 3)
-        settings.addLayout(form)
-
-        self.advanced_toggle = QToolButton()
-        self.advanced_toggle.setText("高级设置")
-        self.advanced_toggle.setCheckable(True)
-        self.advanced_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.advanced_toggle.setArrowType(Qt.RightArrow)
-        settings.addWidget(self.advanced_toggle)
-        self.advanced = QWidget()
-        advanced = QGridLayout(self.advanced)
-        advanced.setContentsMargins(0, 3, 0, 0)
-        self.ai = QCheckBox("AI 超分")
-        self.interp = QCheckBox("AI 插帧")
+        self.ai = QCheckBox("启用超分")
+        self.interp = QCheckBox("启用插帧")
         self.model = SafeComboBox()
-        for label, value in [("通用 / 实拍 · x4plus", "realesrgan-x4plus"), ("动画视频 · animevideov3", "realesr-animevideov3"),
-                             ("动画增强 · x4plus-anime", "realesrgan-x4plus-anime")]:
+        for label, value in [("通用 / 实拍", "realesrgan-x4plus"), ("动画视频", "realesr-animevideov3"), ("动画增强", "realesrgan-x4plus-anime")]:
             self.model.addItem(label, value)
         self.encoding_preset = SafeComboBox()
-        for label, value in [("标准 · 速度与压缩平衡", "medium"), ("较快 · 更快完成", "fast"),
-                             ("精细 · 更高压缩效率", "slow"), ("测试 · 最快编码", "ultrafast")]:
+        for label, value in [("标准", "medium"), ("较快", "fast"), ("精细", "slow"), ("最快（测试）", "ultrafast")]:
             self.encoding_preset.addItem(label, value)
         self.crf = QSpinBox()
         self.crf.setRange(10, 30)
         self.crf.setValue(18)
-        self.crf.setToolTip("较小数值画质更高、文件更大。推荐 16–20。")
+        self.crf.setToolTip("数值越低，画质越高、文件越大。推荐 16–20。")
         self.batch_size = QSpinBox()
         self.batch_size.setRange(1, 256)
         self.batch_size.setValue(32)
         self.work_size = SafeComboBox()
-        self.work_size.addItem("1080p · AI 工作尺寸", (1920, 1080))
-        self.work_size.addItem("720p · 节省资源", (1280, 720))
-        self.clean = QCheckBox("成功阶段后自动清理临时文件")
+        self.work_size.addItem("1080p 工作尺寸", (1920, 1080))
+        self.work_size.addItem("720p 工作尺寸", (1280, 720))
+        self.rpu = FileField("选择与成片匹配的 RPU.bin", "RPU 元数据 (*.bin);;所有文件 (*)")
+        self.rpu.files_selected.connect(lambda paths: self.import_files(paths, "auto"))
+        self.rpu_label = QLabel("杜比元数据")
+        self.clean = QCheckBox("自动清理临时文件")
         self.clean.setChecked(True)
-        advanced.addWidget(self.ai, 0, 0)
-        advanced.addWidget(self.model, 0, 1)
-        advanced.addWidget(self.interp, 0, 2)
-        advanced.addWidget(self.work_size, 0, 3)
-        advanced.addWidget(QLabel("编码预设"), 1, 0)
+        advanced.addWidget(QLabel("画面格式"), 0, 0)
+        advanced.addWidget(self.color, 0, 1)
+        advanced.addWidget(QLabel("音频编码"), 0, 2)
+        advanced.addWidget(self.audio_mode, 0, 3)
+        advanced.addWidget(QLabel("编码速度"), 1, 0)
         advanced.addWidget(self.encoding_preset, 1, 1)
         advanced.addWidget(QLabel("画质 CRF"), 1, 2)
         advanced.addWidget(self.crf, 1, 3)
-        advanced.addWidget(QLabel("每批帧数"), 2, 0)
-        advanced.addWidget(self.batch_size, 2, 1)
-        advanced.addWidget(self.clean, 2, 2, 1, 2)
-        advanced.addWidget(QLabel("替换音轨"), 3, 0)
-        advanced.addWidget(self.audio, 3, 1, 1, 3)
+        advanced.addWidget(self.ai, 2, 0)
+        advanced.addWidget(self.model, 2, 1)
+        advanced.addWidget(self.interp, 2, 2)
+        advanced.addWidget(self.work_size, 2, 3)
+        advanced.addWidget(QLabel("每批帧数"), 3, 0)
+        advanced.addWidget(self.batch_size, 3, 1)
+        advanced.addWidget(self.clean, 3, 2, 1, 2)
+        advanced.addWidget(self.rpu_label, 4, 0)
+        advanced.addWidget(self.rpu, 4, 1, 1, 3)
+        tool_row = QHBoxLayout()
+        tool_row.addWidget(self.tool_label)
+        tool_row.addStretch()
+        tool_row.addWidget(self.check_tools)
+        adjustment_layout.addLayout(tool_row)
         self.advanced.hide()
-        settings.addWidget(self.advanced)
-        stack.addWidget(self.param_group)
+        stack.addWidget(self.advanced)
 
-        self.quality_group = QGroupBox("03   本地质检")
-        quality_layout = QVBoxLayout(self.quality_group)
-        quality_top = QHBoxLayout()
-        self.quality_status = QLabel("等待素材检查")
-        self.quality_status.setObjectName("sectionTitle")
-        quality_top.addWidget(self.quality_status, 1)
+        self.quality_group = QGroupBox("格式检查")
+        q = QVBoxLayout(self.quality_group)
+        qrow = QHBoxLayout()
+        self.quality_status = QLabel("尚未检查")
         self.platform_status = QLabel("平台尚未验收")
-        self.platform_status.setObjectName("subtlePill")
-        quality_top.addWidget(self.platform_status)
-        quality_layout.addLayout(quality_top)
+        self.platform_status.setObjectName("muted")
+        qrow.addWidget(self.quality_status, 1)
+        qrow.addWidget(self.platform_status)
+        qrow.addWidget(self.preflight)
+        q.addLayout(qrow)
         self.output_summary = QLabel()
         self.output_summary.setWordWrap(True)
-        self.output_summary.setObjectName("notice")
         self.output_summary.hide()
-        quality_layout.addWidget(self.output_summary)
-        self.quality_details = QLabel("检查 Dolby Vision Profile、HLG / PQ、位深、分辨率、帧率与音轨。\n技术检查通过后，还需平台草稿转码确认。")
+        q.addWidget(self.output_summary)
+        self.quality_details = QLabel("导入后自动检查素材。平台识别结果仍需上传草稿并等待转码确认。")
         self.quality_details.setObjectName("muted")
         self.quality_details.setWordWrap(True)
-        quality_layout.addWidget(self.quality_details)
+        q.addWidget(self.quality_details)
         self.space_label = QLabel()
         self.space_label.setObjectName("muted")
         self.space_label.setWordWrap(True)
-        quality_layout.addWidget(self.space_label)
+        q.addWidget(self.space_label)
+        self.quality_group.hide()
         stack.addWidget(self.quality_group)
-
-        self.log_toggle = QToolButton()
-        self.log_toggle.setText("处理日志")
-        self.log_toggle.setCheckable(True)
-        self.log_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-        self.log_toggle.setArrowType(Qt.RightArrow)
-        stack.addWidget(self.log_toggle)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
         self.log.setMaximumBlockCount(1500)
-        self.log.setMinimumHeight(150)
         self.log.setMaximumHeight(220)
+        self.log.setMinimumHeight(130)
         self.log.hide()
         stack.addWidget(self.log)
-        stack.addStretch()
+        # These labels retain the source-summary API without presenting cards.
+        self.source_video = (None, QLabel(self))
+        self.source_dv = (None, QLabel(self))
+        self.source_audio = (None, QLabel(self))
+        for _, label in (self.source_video, self.source_dv, self.source_audio):
+            label.hide()
 
         footer = QFrame()
         footer.setObjectName("footer")
         foot = QVBoxLayout(footer)
-        foot.setContentsMargins(16, 12, 16, 12)
-        status = QHBoxLayout()
-        self.stage_label = QLabel("导入素材，选择交付方案后开始。")
-        self.stage_label.setObjectName("sectionTitle")
-        self.elapsed = QLabel("")
+        foot.setContentsMargins(0, 10, 0, 0)
+        foot.setSpacing(8)
+        status_row = QHBoxLayout()
+        self.stage_label = QLabel("添加视频后，点击“开始处理”。")
+        self.elapsed = QLabel()
         self.elapsed.setObjectName("muted")
-        status.addWidget(self.stage_label, 1)
-        status.addWidget(self.elapsed)
-        foot.addLayout(status)
+        status_row.addWidget(self.stage_label, 1)
+        status_row.addWidget(self.elapsed)
+        foot.addLayout(status_row)
         self.progress = QProgressBar()
         self.progress.setRange(0, 1000)
         self.progress.setFormat("0.0%")
         foot.addWidget(self.progress)
         controls = QHBoxLayout()
-        self.start = QPushButton("开始交付")
+        self.start = QPushButton("开始处理")
         self.start.setObjectName("primary")
-        self.start.setMinimumWidth(135)
+        self.start.setMinimumWidth(140)
+        self.start.setEnabled(False)
         self.resume = QPushButton("恢复上次任务")
         self.pause = QPushButton("暂停")
         self.stop = QPushButton("停止")
         self.open_output = QPushButton("打开输出目录")
-        self.view_report = QPushButton("查看质检报告")
+        self.view_report = QPushButton("查看报告")
         for button in (self.start, self.resume, self.pause, self.stop):
             controls.addWidget(button)
         controls.addStretch()
         controls.addWidget(self.open_output)
         controls.addWidget(self.view_report)
-        self.pause.setEnabled(False)
-        self.stop.setEnabled(False)
-        self.open_output.setEnabled(False)
-        self.view_report.setEnabled(False)
+        for button in (self.pause, self.stop, self.open_output, self.view_report):
+            button.setEnabled(False)
         foot.addLayout(controls)
         shell.addWidget(footer)
 
@@ -475,7 +622,7 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.update_elapsed)
         self.probe_timer = QTimer(self)
         self.probe_timer.setSingleShot(True)
-        self.probe_timer.setInterval(400)
+        self.probe_timer.setInterval(350)
         self.probe_timer.timeout.connect(self.start_probe)
         self.start.clicked.connect(self.start_new)
         self.resume.clicked.connect(self.resume_previous)
@@ -484,60 +631,71 @@ class MainWindow(QMainWindow):
         self.open_output.clicked.connect(self.open_output_folder)
         self.view_report.clicked.connect(self.show_report)
         self.video.changed.connect(self.video_changed)
-        self.export_preset.currentIndexChanged.connect(self.apply_preset)
+        self.audio.changed.connect(self.audio_changed)
+        self.export_preset.currentIndexChanged.connect(self.preset_selected)
         self.advanced_toggle.toggled.connect(self.toggle_advanced)
+        self.quality_toggle.toggled.connect(self.toggle_quality)
         self.log_toggle.toggled.connect(self.toggle_log)
         for combo in (self.model, self.resolution, self.fps, self.color, self.audio_mode):
             combo.currentIndexChanged.connect(self.update_estimates)
+            combo.currentIndexChanged.connect(self.update_automatic_summary)
+        self.resolution.currentIndexChanged.connect(self.refresh_start_state)
         self.color.currentIndexChanged.connect(self.update_control_states)
+        self.audio_mode.currentIndexChanged.connect(self.audio_mode_selected)
         self.ai.toggled.connect(self.update_control_states)
         self.interp.toggled.connect(self.update_control_states)
         self.clean.toggled.connect(self.update_estimates)
         self.batch_size.valueChanged.connect(self.update_estimates)
+        self.shortcut_open = QShortcut(QKeySequence.Open, self)
+        self.shortcut_open.activated.connect(self.choose_media)
         self.apply_preset()
         self.load_preferences()
+        # Import defaults are determined from each source, not a prior project.
+        self._choosing_automatic = True
+        self.select_data(self.export_preset, "preserve")
+        self._choosing_automatic = False
+        self.apply_preset()
+        self.advanced_toggle.setChecked(False)
+        self._preset_explicit = False
+        self._audio_mode_explicit = False
+        self.set_compatible_audio()
         self.refresh_resume()
         self.check_environment(silent=True)
 
     @staticmethod
     def stylesheet():
         return """
-        QMainWindow, QWidget { background:#111724; color:#e8edf5; font-family:'Microsoft YaHei','Segoe UI'; font-size:12px; }
-        QWidget#content { background:#111724; }
-        QLabel#brand { color:#f1f7ff; font-size:22px; font-weight:700; letter-spacing:2px; }
-        QLabel#muted { color:#8f9db3; }
-        QLabel#eyebrow { color:#6de2d3; font-size:12px; font-weight:700; }
-        QLabel#sectionTitle { color:#e8edf5; font-size:13px; font-weight:600; }
-        QLabel#statusPill { background:#163a36; color:#82e4cc; border:1px solid #23584e; border-radius:12px; padding:7px 14px; }
-        QLabel#subtlePill { color:#a7b4c8; background:#263042; border-radius:9px; padding:5px 10px; font-size:11px; }
-        QFrame#sidebar, QFrame#footer { background:#182131; border:1px solid #2b374a; border-radius:12px; }
-        QFrame#sidebar QLabel, QFrame#footer QLabel { background:transparent; }
-        QGroupBox { background:#182131; border:1px solid #2b374a; border-radius:12px; margin-top:9px; padding:24px 15px 14px; }
-        QGroupBox::title { subcontrol-origin:margin; left:17px; top:3px; color:#a6b5cc; font-size:12px; font-weight:600; padding:0 5px; }
+        QMainWindow, QWidget { background:#f3f4f6; color:#242a32; font-family:'Microsoft YaHei UI','Microsoft YaHei','Segoe UI'; font-size:16px; }
+        QLabel#appName { font-size:20px; font-weight:600; padding-right:10px; }
+        QLabel#muted { color:#697382; font-size:14px; }
+        QLabel#automaticSummary { color:#263548; font-size:18px; }
+        QLabel#notification { color:#5b6573; padding:3px 0; }
+        QLabel#dropTitle { color:#333d4b; font-size:24px; font-weight:500; }
+        QFrame#dropArea { background:white; border:1px dashed #aab3bf; border-radius:7px; }
+        QFrame#dropArea QLabel, QFrame#dropArea QWidget { background:transparent; }
+        QGroupBox { background:white; border:1px solid #d4d9e0; border-radius:6px; margin-top:8px; padding:18px 12px 12px; }
+        QGroupBox::title { subcontrol-origin:margin; left:12px; top:1px; padding:0 4px; color:#3e4856; font-weight:600; }
         QGroupBox QLabel, QGroupBox QWidget { background:transparent; }
-        QLabel#notice { background:#142c38; color:#acd4de; border:1px solid #27444f; border-radius:7px; padding:10px 12px; }
-        QFrame#metric { background:#1e2a3e; border:1px solid #2b3a51; border-radius:7px; }
-        QFrame#metric QLabel { background:transparent; }
-        QLabel#metricValue { color:#e8f1ff; font-size:13px; font-weight:600; }
-        QLineEdit, QComboBox, QSpinBox { background:#202c40; border:1px solid #34435b; border-radius:6px; padding:7px 9px; min-height:18px; selection-background-color:#167b8a; }
-        QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border:1px solid #4ebcac; }
-        QComboBox::drop-down { border:0; width:22px; }
-        QComboBox QAbstractItemView { background:#202c40; color:#e8edf5; selection-background-color:#2c5360; }
-        QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled { color:#7d8a9c; background:#1b2433; border-color:#293447; }
-        QPushButton { background:#28364c; border:1px solid #3a4960; border-radius:6px; padding:8px 11px; }
-        QPushButton:hover { background:#344760; border-color:#58718c; }
-        QPushButton:disabled { color:#66758b; background:#202a3b; border-color:#2b384a; }
-        QPushButton#primary { background:#1b9a8a; border-color:#30b8a2; color:white; font-weight:700; }
-        QPushButton#primary:hover { background:#24ad9b; }
-        QToolButton { color:#a5b8d2; border:0; padding:5px 0; text-align:left; }
+        QLineEdit, QComboBox, QSpinBox { background:white; color:#242a32; border:1px solid #bdc5cf; border-radius:4px; padding:9px 10px; min-height:20px; selection-background-color:#d9e8ff; selection-color:#162d4b; }
+        QLineEdit:focus, QComboBox:focus, QSpinBox:focus { border:1px solid #3676c8; }
+        QLineEdit:read-only { color:#4d5867; background:#f8f9fb; }
+        QComboBox::drop-down { border:0; width:20px; }
+        QComboBox QAbstractItemView { background:white; color:#242a32; selection-background-color:#e3edfb; }
+        QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled { color:#8b94a1; background:#f0f2f5; border-color:#dce0e5; }
+        QPushButton { background:#fff; border:1px solid #bdc5cf; border-radius:4px; padding:8px 14px; min-height:22px; font-size:16px; }
+        QPushButton:hover { background:#edf3fc; border-color:#7f9fc7; }
+        QPushButton:pressed { background:#e0eaf8; }
+        QPushButton:disabled { color:#a2a9b3; background:#f4f5f7; border-color:#dde1e6; }
+        QPushButton#primary { color:white; background:#2563d9; border-color:#2563d9; font-weight:600; }
+        QPushButton#primary:hover { background:#1d4ed8; }
+        QPushButton#primary:disabled { background:#a9bfdb; border-color:#a9bfdb; color:#f8fafc; }
+        QToolButton { background:transparent; color:#53677f; border:0; padding:5px 3px; }
         QCheckBox { spacing:7px; }
-        QCheckBox::indicator { width:16px; height:16px; border:1px solid #53647b; border-radius:4px; background:#243147; }
-        QCheckBox::indicator:checked { background:#1b9a8a; border-color:#58cebb; }
-        QPlainTextEdit { background:#101826; color:#a8b8cf; border:1px solid #2b3a50; border-radius:7px; font-family:Consolas; font-size:11px; }
-        QProgressBar { background:#101927; border:1px solid #304157; border-radius:5px; text-align:center; min-height:17px; font-size:11px; }
-        QProgressBar::chunk { background:#1b9a8a; border-radius:4px; }
-        QScrollBar:vertical { background:#111724; width:8px; margin:0; }
-        QScrollBar::handle:vertical { background:#3c4b63; border-radius:4px; min-height:30px; }
+        QPlainTextEdit { background:#fafbfc; color:#364152; border:1px solid #d5dbe3; border-radius:4px; font-family:Consolas; font-size:14px; }
+        QProgressBar { background:#e2e6ed; color:#263548; border:0; border-radius:3px; text-align:center; min-height:20px; font-size:14px; }
+        QProgressBar::chunk { background:#6b9bd5; border-radius:3px; }
+        QScrollBar:vertical { background:#f3f4f6; width:9px; margin:0; }
+        QScrollBar::handle:vertical { background:#bdc5cf; border-radius:4px; min-height:26px; }
         QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height:0; }
         """
 
@@ -570,7 +728,331 @@ class MainWindow(QMainWindow):
 
     def current_route(self):
         key = self.export_preset.currentData()
-        return "preserve" if key == "bili_preserve" else "enhance" if key == "enhance" else "transcode"
+        return "preserve" if key in ("preserve", "bili_preserve") else "enhance" if key == "enhance" else "transcode"
+
+    def choose_media(self):
+        if self.worker is not None or self.intake_busy:
+            return
+        paths, _ = QFileDialog.getOpenFileNames(self, "添加视频或音频", "", "媒体文件 (*.mp4 *.mkv *.mov *.m4v *.avi *.webm *.ts *.m2ts *.mxf *.wav *.flac *.mp3 *.aac *.m4a *.eac3 *.ac3 *.mka *.ogg *.opus);;所有文件 (*)")
+        if paths:
+            self.import_files(paths, "auto")
+
+    def notify(self, message, error=False):
+        self.notification.setText(message)
+        self.notification.setStyleSheet("color:#a3342b" if error else "color:#5b6573")
+
+    def dragEnterEvent(self, event):
+        if self.worker is None and not self.intake_busy and event.mimeData().hasUrls() and all(url.isLocalFile() for url in event.mimeData().urls()):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event):
+        paths = [url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]
+        if self.import_files(paths, "auto"):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def import_files(self, paths, target="auto"):
+        if self.worker is not None:
+            message = "正在导出，素材不能更改。请先停止任务。"
+            self.notify(message, True)
+            self.intake_finished.emit(False, message)
+            return False
+        if self.intake_busy:
+            message = "正在读取文件，请稍候再添加。"
+            self.notify(message)
+            self.intake_finished.emit(False, message)
+            return False
+        if target not in ("auto", "video", "audio") or not paths:
+            message = "没有可导入的媒体文件。"
+            self.notify(message, True)
+            self.intake_finished.emit(False, message)
+            return False
+        normalized = []
+        for path in paths:
+            text = str(path)
+            if text not in normalized:
+                normalized.append(text)
+        self.intake_busy = True
+        self.import_button.setEnabled(False)
+        self.audio_clear.setEnabled(False)
+        self.start.setEnabled(False)
+        self.resume.setEnabled(False)
+        self.param_group.setEnabled(False)
+        self.advanced.setEnabled(False)
+        self.notify("正在检查文件…")
+        thread = IntakeThread(normalized, target)
+        self.intakes.add(thread)
+        thread.result.connect(lambda entries, error, t=thread: self.finish_intake(t, entries, error))
+        thread.finished.connect(lambda t=thread: self.intake_thread_finished(t))
+        thread.start()
+        return True
+
+    def intake_thread_finished(self, thread):
+        self.intakes.discard(thread)
+        if not getattr(thread, "_delivered", False):
+            self.intake_busy = False
+            self.intake_finished.emit(False, "导入已取消。")
+        thread.deleteLater()
+        if self.closing and self.worker is None and not self.probes and not self.intakes:
+            self.close()
+
+    def finish_intake(self, thread, entries, error):
+        thread._delivered = True
+        self.intake_busy = False
+        self.import_button.setEnabled(self.worker is None)
+        self.param_group.setEnabled(self.worker is None)
+        self.advanced.setEnabled(self.worker is None)
+        if self.closing:
+            self.intake_finished.emit(False, "窗口正在关闭。")
+            return
+        if self.worker is not None:
+            error = "正在导出，未更改素材。"
+        videos = [item for item in entries if item["kind"] == "video"]
+        audios = [item for item in entries if item["kind"] == "audio"]
+        video, audio = None, None
+        if not error and thread.target == "audio":
+            if len(entries) != 1:
+                error = "音轨区域一次只接受一个音频文件或一个含音轨的视频，当前素材保持不变。"
+            elif not entries[0]["info"].get("audio_streams"):
+                error = "这个文件没有音轨，当前音轨保持不变。"
+            else:
+                audio = entries[0]
+        elif not error:
+            if len(videos) > 1:
+                error = "一次只能处理一个视频。请分别添加，当前素材保持不变。"
+            elif len(audios) > 1:
+                error = "一次只能添加一个替换音频，当前素材保持不变。"
+            elif thread.target == "video" and (len(videos) != 1 or audios):
+                error = "请在视频区域添加一个视频；替换音频请拖到音轨区域。"
+            else:
+                video = videos[0] if videos else None
+                audio = audios[0] if audios else None
+        if error:
+            self.notify(error, True)
+            self.update_audio_hint()
+            self.refresh_start_state()
+            self.refresh_resume()
+            self.intake_finished.emit(False, error)
+            return
+        old_video = self.video.filepath
+        self._intake_committing = True
+        try:
+            if video:
+                different = not old_video or Path(old_video).resolve() != Path(video["path"]).resolve()
+                if different:
+                    self._preset_explicit = False
+                    self._preserve_restored_settings = False
+                    self._audio_mode_explicit = False
+                if old_video and different and audio is None:
+                    self.ainfo = None
+                    self.audio.set_file("")
+                self.video.set_file(video["path"])
+                self.probe_timer.stop()
+            if audio:
+                self.ainfo = audio["info"]
+                self._audio_mode_explicit = False
+                self.audio.set_file(audio["path"])
+            if video:
+                self.on_probe(video["path"], video["info"], "")
+            self.set_compatible_audio()
+            self.update_audio_hint()
+        finally:
+            self._intake_committing = False
+        if video and audio:
+            message = "视频和替换音频已添加。确认设置后点击“开始处理”。"
+        elif video:
+            message = "视频已添加。确认设置后点击“开始处理”。"
+        elif self.video.filepath:
+            message = "替换音频已添加，可随时点击“使用原音”恢复。"
+        else:
+            message = "音频已添加，请继续拖入视频。"
+        if self.output_size_needs_attention():
+            message = "这个视频的尺寸太小，兼容转码需至少 64 × 48。请在“调整设置”中选择输出尺寸，当前不会开始编码。"
+        self.notify(message)
+        self.refresh_start_state()
+        self.refresh_resume()
+        self.intake_finished.emit(True, message)
+
+    def set_compatible_audio(self):
+        if self._audio_mode_explicit:
+            self.update_audio_hint()
+            return
+        info = self.ainfo if self.audio.filepath and self.ainfo else self.vinfo or {}
+        codec = info.get("audio_codec", "none")
+        mode = "copy" if codec in ("none", "aac", "ac3", "eac3", "mp3", "alac") else "aac"
+        self._setting_audio_mode = True
+        try:
+            self.select_data(self.audio_mode, mode)
+        finally:
+            self._setting_audio_mode = False
+
+    def audio_mode_selected(self):
+        if not self._setting_audio_mode and not self.restore_in_progress:
+            self._audio_mode_explicit = True
+        self.update_audio_hint()
+
+    def audio_changed(self, path):
+        if not path:
+            self.ainfo = None
+        self.update_audio_hint()
+
+    def update_audio_hint(self):
+        if not hasattr(self, "audio_hint"):
+            return
+        self.audio_clear.setEnabled(bool(self.audio.filepath) and self.worker is None and not self.intake_busy)
+        if self.audio.filepath:
+            codec = (self.ainfo or {}).get("audio_codec", "")
+            atmos = (self.ainfo or {}).get("atmos")
+            text = "将使用替换音频"
+            if codec:
+                text += f" · {codec.upper()}"
+            text += self.audio_processing_hint(codec, atmos)
+            if not self.video.filepath:
+                text += "；请继续添加视频。"
+            self.audio_hint.setText(text)
+        elif self.vinfo:
+            codec = self.vinfo.get("audio_codec", "none")
+            if codec == "none":
+                self.audio_hint.setText("视频无音轨；可拖入音频，也可以导出静音视频。")
+            else:
+                suffix = self.audio_processing_hint(codec, self.vinfo.get("atmos"))
+                self.audio_hint.setText(f"使用视频原音 · {codec.upper()}{suffix}")
+        else:
+            self.audio_hint.setText("未替换音频时，直接使用视频原音。")
+        self.update_automatic_summary()
+
+    def update_automatic_summary(self):
+        if not hasattr(self, "automatic_summary"):
+            return
+        if not self.vinfo:
+            self.automatic_summary.setText("音频已添加，继续添加视频即可。" if self.audio.filepath else "添加视频后自动检查格式。\n通常无需调整设置，直接开始处理。")
+            return
+        route = self.current_route()
+        picture = "画面保持原样" if route == "preserve" else "画面按所选设置处理"
+        if self._smart_native_conversion and route == "transcode":
+            source_color = {"arib-std-b67": "hlg", "smpte2084": "hdr10"}.get(self.vinfo.get("color_transfer"), "sdr")
+            unchanged = tuple(self.resolution.currentData()) == (0, 0) and not self.fps.currentData() and self.color.currentData() == source_color
+            picture = "自动转为兼容 MP4\n" + ("保持源尺寸、帧率和色彩设置" if unchanged else "画面按所选设置处理")
+        if self.output_size_needs_attention():
+            picture += "\n原片尺寸过小，请在“调整设置”中选择更大尺寸"
+        source_dv = self.vinfo.get("dv_profile")
+        if source_dv and route != "preserve":
+            if self.color.currentData() in ("dv81", "dv84"):
+                picture += "\n仅使用原片基础层；原杜比元数据不保留，将按配套 RPU 重新制作"
+            else:
+                picture += "\n仅处理基础层，不保留原杜比标签"
+        mode = self.audio_mode.currentData()
+        if mode == "none":
+            sound = "不保留音轨"
+        elif self.audio.filepath:
+            sound = "使用替换音频"
+        elif self.vinfo.get("audio_codec", "none") == "none":
+            sound = "原片无音轨，可直接处理或另加音频"
+        else:
+            sound = "使用原音"
+        prefix = "保存到" if self._output_user_modified else "自动保存到"
+        destination = self.output.text().strip()
+        self.automatic_summary.setText(f"{picture}\n\n{sound}\n\n{prefix}：\n{Path(destination).name if destination else '视频所在文件夹'}")
+
+    def audio_processing_hint(self, codec, atmos):
+        mode = self.audio_mode.currentData()
+        if mode == "none":
+            return " · 当前设置不导出音轨（不保留 Atmos）" if atmos == "confirmed" else " · 当前设置不导出音轨"
+        if mode == "copy" and codec in ("aac", "ac3", "eac3", "mp3", "alac"):
+            return " · Atmos 已确认，将保留原码流" if atmos == "confirmed" else " · 保留原音轨"
+        if mode in ("aac", "eac3"):
+            return f" · 转为 {mode.upper()}，不保留 Atmos 对象元数据" if atmos == "confirmed" else f" · 转为 {mode.upper()}"
+        if codec == "truehd":
+            return " · TrueHD 不能直接封装为 MP4，请选择 AAC 或 E-AC-3"
+        return ""
+
+    def restore_original_audio(self):
+        if self.worker is not None or self.intake_busy:
+            return
+        self.ainfo = None
+        self._audio_mode_explicit = False
+        self.audio.set_file("")
+        self.set_compatible_audio()
+        self.update_audio_hint()
+        self.notify("已恢复视频原音。" if self.vinfo else "已移除待配对音频。")
+
+    def output_edited(self, text):
+        if not self._programmatic_output:
+            self._output_user_modified = bool(text.strip())
+        self.update_automatic_summary()
+
+    def default_output(self, path):
+        source = Path(path)
+        candidate = source.with_name(source.stem + "_导出.mp4")
+        counter = 2
+        while candidate.exists() or candidate.resolve() == source.resolve():
+            candidate = source.with_name(f"{source.stem}_导出_{counter}.mp4")
+            counter += 1
+        return str(candidate)
+
+    def preset_selected(self):
+        if not self.restore_in_progress and not getattr(self, "_choosing_automatic", False):
+            self._preset_explicit = True
+            self._preserve_restored_settings = False
+            self._smart_native_conversion = False
+        self.apply_preset()
+
+    def open_source(self):
+        if self.video.filepath and Path(self.video.filepath).is_file():
+            QDesktopServices.openUrl(QUrl.fromLocalFile(self.video.filepath))
+
+    def choose_source_preset(self):
+        if self._preset_explicit or not self.vinfo:
+            return
+        info = self.vinfo
+        suitable = info.get("dv_profile") == 8 and info.get("dv_compatibility") == 4 and info.get("color_transfer") == "arib-std-b67"
+        if suitable:
+            from quality import assess_bilibili
+            suitable = assess_bilibili(info).get("status") != "fail"
+        codec = str(info.get("codec_name") or info.get("stream", {}).get("codec_name") or "unknown").lower()
+        containers = {name.strip().lower() for name in str(info.get("container") or info.get("format", {}).get("format_name") or "").split(",")}
+        # Annex B to MP4 changes the bitstream representation; use the native
+        # route rather than a copy that cannot pass strict payload validation.
+        annex_b = bool(containers & {"mpegts", "h264", "hevc"})
+        mp4_copyable = codec in {"h264", "hevc", "av1", "vp9", "mpeg4"} and not annex_b
+        self._smart_native_conversion = not mp4_copyable
+        key = "bili_preserve" if suitable and mp4_copyable else "preserve" if mp4_copyable else "quality"
+        self._choosing_automatic = True
+        self.select_data(self.export_preset, key)
+        self._choosing_automatic = False
+        self.apply_preset()
+
+    def output_size_needs_attention(self):
+        if not self.vinfo or self.current_route() == "preserve":
+            return False
+        cfg = self.config()
+        return cfg["width"] < 64 or cfg["height"] < 48
+
+    def refresh_start_state(self):
+        if not hasattr(self, "start"):
+            return
+        ready = self.vinfo is not None and self.worker is None and not self.intake_busy
+        self.start.setEnabled(ready and not self.output_size_needs_attention())
+        self.update_automatic_summary()
+
+    def toggle_window_state(self):
+        if self.isMaximized():
+            self.showNormal()
+        else:
+            self.showMaximized()
+        self.update_window_button()
+
+    def update_window_button(self):
+        if hasattr(self, "window_toggle"):
+            self.window_toggle.setText("还原窗口" if self.isMaximized() else "最大化")
+
+    def changeEvent(self, event):
+        super().changeEvent(event)
+        if event.type() == QEvent.WindowStateChange:
+            self.update_window_button()
 
     def config(self):
         route = self.current_route()
@@ -614,7 +1096,6 @@ class MainWindow(QMainWindow):
         self.interp.setChecked(key == "enhance" and self.interp_available)
         self.select_data(self.resolution, (0, 0))
         self.select_data(self.fps, 120 if key == "enhance" else 0)
-        self.select_data(self.audio_mode, "copy")
         if key == "bili_make":
             self.select_data(self.color, "dv84")
             if self.vinfo:
@@ -629,7 +1110,7 @@ class MainWindow(QMainWindow):
             self.select_data(self.color, {"arib-std-b67": "hlg", "smpte2084": "hdr10"}.get(transfer, "sdr"))
         elif key == "enhance":
             self.select_data(self.color, "sdr")
-        elif key == "bili_preserve" and self.vinfo:
+        elif key in ("preserve", "bili_preserve") and self.vinfo:
             self.select_data(self.resolution, (0, 0))
             rate = self.vinfo.get("fps_fraction", self.vinfo["fps"])
             if not self.select_data(self.fps, rate):
@@ -639,8 +1120,11 @@ class MainWindow(QMainWindow):
             color = "dv84" if profile == 8 and compat == 4 else "dv81" if profile == 8 and compat == 1 else {
                 "arib-std-b67": "hlg", "smpte2084": "hdr10"}.get(self.vinfo.get("color_transfer"), "sdr")
             self.select_data(self.color, color)
+        self.set_compatible_audio()
         self.update_control_states()
         self.update_estimates()
+        self.update_automatic_summary()
+        self.refresh_start_state()
         if self.vinfo:
             self.render_source_quality()
 
@@ -659,6 +1143,9 @@ class MainWindow(QMainWindow):
         self.rpu.setVisible(needs_rpu)
         self.rpu_label.setVisible(needs_rpu)
         self.rpu.setEnabled(needs_rpu and not running)
+        if needs_rpu:
+            self.advanced_toggle.setChecked(True)
+        self.audio_clear.setEnabled(bool(self.audio.filepath) and not running and not self.intake_busy)
         self.update_estimates()
 
     def update_rpu_state(self):
@@ -672,16 +1159,27 @@ class MainWindow(QMainWindow):
         self.log.setVisible(enabled)
         self.log_toggle.setArrowType(Qt.DownArrow if enabled else Qt.RightArrow)
 
+    def toggle_quality(self, enabled):
+        self.quality_group.setVisible(enabled)
+        self.quality_toggle.setArrowType(Qt.DownArrow if enabled else Qt.RightArrow)
+
     def choose_output(self):
         initial = self.output.text() or str(BASE_DIR)
         path, _ = QFileDialog.getSaveFileName(self, "选择新的输出文件", initial, "MP4 视频 (*.mp4)")
         if path:
             self.output.setText(path if path.lower().endswith(".mp4") else path + ".mp4")
+            self._output_user_modified = True
+            self.update_automatic_summary()
 
     def video_changed(self, path):
         for probe in self.probes:
             probe.request_stop()
         self.vinfo = None
+        self.play_source.hide()
+        if not self.restore_in_progress:
+            self._preserve_restored_settings = False
+            self.outcome = None
+            self._smart_native_conversion = False
         self.last_report = None
         self.last_output = None
         self.view_report.setEnabled(False)
@@ -692,11 +1190,14 @@ class MainWindow(QMainWindow):
         self.source_dv[1].setText("尚未检测")
         self.source_audio[1].setText("尚未检测")
         self.quality_status.setText("正在检查素材" if path else "等待素材检查")
+        self.start.setEnabled(False)
+        self.drop_title.setText(Path(path).name if path else "将视频拖到这里")
+        self.drop_hint.setText("正在检查视频…" if path else "或点击上方“添加文件”\n可以同时选择视频和音频")
         self.space_label.clear()
-        if not self.restore_in_progress and path:
-            stem = Path(path).stem
-            self.output.setText(str(Path(path).with_name(stem + "_delivery.mp4")))
-        self.probe_timer.start()
+        if not self.restore_in_progress and path and not self._output_user_modified:
+            self.output.setText(self.default_output(path))
+        if not self._intake_committing:
+            self.probe_timer.start()
 
     def start_probe(self):
         path = self.video.filepath
@@ -723,10 +1224,11 @@ class MainWindow(QMainWindow):
             self.info_label.setText(f"无法读取素材：{error}")
             self.quality_status.setText("素材检查失败")
             self.quality_details.setText("请检查文件是否有效，以及 FFprobe 工具是否已安装。")
+            self.start.setEnabled(False)
             return
         rotation = info.get("rotation", 0)
         rotation_note = f"　·　旋转 {rotation}°" if rotation else ""
-        self.info_label.setText(f"{info['filename']}　·　{fmt_time(info['duration'])}　·　约 {info['total_frames']} 帧{rotation_note}")
+        self.info_label.setText(f"{info.get('display_width', info['width'])} × {info.get('display_height', info['height'])}　·　{info['fps']:.3f} fps　·　{fmt_time(info['duration'])}{rotation_note}")
         width, height = info.get("display_width", info["width"]), info.get("display_height", info["height"])
         self.source_video[1].setText(f"{width} × {height}\n{info['fps']:.3f} fps")
         profile, compat = info.get("dv_profile"), info.get("dv_compatibility")
@@ -737,9 +1239,23 @@ class MainWindow(QMainWindow):
         audio = audio_codec.upper() if audio_codec and audio_codec != "none" else "无音轨"
         atmos = {"confirmed": "Atmos 已确认", "unknown": "Atmos 待确认", "absent": "无 Atmos 标记"}.get(info.get("atmos"), "Atmos 待确认")
         self.source_audio[1].setText(f"{audio}\n{atmos}")
-        if not self.restore_in_progress and self.worker is None:
-            self.apply_preset()
-        self.render_source_quality()
+        self.drop_title.setText(info.get("filename") or Path(path).name)
+        self.drop_hint.setText("可直接开始处理，也可以继续拖入音频替换原音。")
+        if not self.restore_in_progress and self.worker is None and not self._preserve_restored_settings:
+            self.choose_source_preset()
+            if self._preset_explicit:
+                self.apply_preset()
+        self.set_compatible_audio()
+        self.update_audio_hint()
+        self.play_source.show()
+        self.refresh_start_state()
+        result_visible = self.last_output is not None or (self._preserve_restored_settings and self.outcome is not None)
+        if self.worker is None and not result_visible:
+            attention = self.output_size_needs_attention()
+            self.top_status.setText("需要调整尺寸" if attention else "可以处理")
+            self.stage_label.setText("请在“调整设置”中选择更大输出尺寸。" if attention else "准备就绪，点击“开始处理”。")
+        if not result_visible:
+            self.render_source_quality()
         self.update_estimates()
 
     def render_source_quality(self):
@@ -752,8 +1268,10 @@ class MainWindow(QMainWindow):
             if self.export_preset.currentData().startswith("bili_"):
                 self.render_quality(report, "素材检查")
             else:
-                self.quality_status.setText("素材已读取 · 使用原生精度处理")
-                self.quality_details.setText("常规交付按所选色彩与画质设置导出。原片保留不重编码；AI 增强请先确认工作精度适合素材。")
+                self.quality_status.setText("素材已读取")
+                self.quality_status.setStyleSheet("color:#374151;font-weight:600")
+                self.quality_details.setText("已按源文件选择处理方式。保持原画质时不重编码视频；B站杜比格式需单独检查和平台转码验收。")
+                self.view_report.setEnabled(True)
         except ImportError:
             self.quality_status.setText("素材已读取")
             self.quality_details.setText("画面与音轨信息已读取；交付质检组件尚未就绪。")
@@ -762,7 +1280,7 @@ class MainWindow(QMainWindow):
         status = report.get("status", "warning")
         label = {"pass": "本地技术条件通过", "warning": "有事项需要确认", "fail": "尚不符合目标条件"}.get(status, "待确认")
         self.quality_status.setText(f"{prefix} · {label}")
-        colors = {"pass": "#70d4b4", "warning": "#ecc387", "fail": "#ef9d9d"}
+        colors = {"pass": "#167347", "warning": "#926200", "fail": "#b3261e"}
         self.quality_status.setStyleSheet(f"color:{colors.get(status, '#adbcd2')};font-weight:600")
         checks = report.get("checks", [])
         problematic = [c for c in checks if c.get("status") != "pass"]
@@ -805,7 +1323,8 @@ class MainWindow(QMainWindow):
             except FileNotFoundError:
                 missing.append(name)
         self.sr_available, self.interp_available = ai_tools_available()
-        self.tool_label.setText("基础工具就绪\nAI 工具" + ("已就绪" if self.sr_available and self.interp_available else "未完整安装"))
+        base_ready = "ffmpeg" in available and "ffprobe" in available
+        self.tool_label.setText(("基础工具可用" if base_ready else "缺少基础工具") + (" · 插帧/超分可用" if self.sr_available and self.interp_available else " · 可选增强工具未齐"))
         if not silent:
             message = "已找到：\n" + "、".join(available)
             if missing:
@@ -835,20 +1354,23 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             checkpoint = None
             self.log.appendPlainText(f"处理记录无法读取：{exc}")
-        self.resume.setEnabled(checkpoint is not None and self.worker is None)
+        self.resume.setEnabled(checkpoint is not None and self.worker is None and not self.intake_busy)
         self.resume.setToolTip(f"恢复原任务：{Path(checkpoint['cfg'].get('video', '')).name}" if checkpoint else "没有可恢复的未完成任务")
 
     def restore_config(self, cfg):
         self.restore_in_progress = True
+        self._preserve_restored_settings = True
+        self._smart_native_conversion = False
         try:
             route = cfg.get("route", "enhance")
-            preset = "bili_preserve" if route == "preserve" else "bili_make" if cfg.get("delivery") == "bilibili" else "enhance" if route == "enhance" else "quality"
+            preset = ("bili_preserve" if cfg.get("delivery") == "bilibili" else "preserve") if route == "preserve" else "bili_make" if cfg.get("delivery") == "bilibili" else "enhance" if route == "enhance" else "quality"
             self.select_data(self.export_preset, preset)
             self.preset_note.setText(self.PRESETS[preset][1])
             self.video.set_file(cfg["video"])
             self.audio.set_file(cfg.get("audio", ""))
             self.rpu.set_file(cfg.get("rpu", ""))
             self.output.setText(str(cfg.get("output", "")))
+            self._output_user_modified = bool(cfg.get("output"))
             for combo, key in [(self.model, "model"), (self.color, "color_mode"), (self.audio_mode, "audio_mode"), (self.encoding_preset, "preset")]:
                 if key in cfg:
                     self.select_data(combo, cfg[key])
@@ -865,12 +1387,13 @@ class MainWindow(QMainWindow):
             self.clean.setChecked(cfg.get("auto_clean", True))
             self.crf.setValue(int(cfg.get("crf", 18)))
             self.batch_size.setValue(int(cfg.get("batch_size", 32)))
+            self._audio_mode_explicit = True
         finally:
             self.restore_in_progress = False
         self.update_control_states()
 
     def resume_previous(self):
-        if self.worker is not None:
+        if self.worker is not None or self.intake_busy:
             return
         try:
             checkpoint = load_checkpoint()
@@ -885,7 +1408,7 @@ class MainWindow(QMainWindow):
             self.refresh_resume()
 
     def start_new(self):
-        if self.worker is not None:
+        if self.worker is not None or self.intake_busy:
             return
         cfg = self.config()
         if not Path(cfg["video"]).is_file():
@@ -894,6 +1417,10 @@ class MainWindow(QMainWindow):
         if not self.vinfo:
             QMessageBox.information(self, "正在分析素材", "请等待素材检查完成后开始；这将确认源分辨率、色彩和音轨，避免误用默认参数。")
             self.start_probe()
+            return
+        if self.output_size_needs_attention():
+            self.notify("兼容转码的尺寸需至少 64 × 48。请在“调整设置”中选择输出尺寸。", True)
+            self.advanced_toggle.setChecked(True)
             return
         if not cfg["output"]:
             self.choose_output()
@@ -906,7 +1433,7 @@ class MainWindow(QMainWindow):
         if cfg["route"] != "preserve" and cfg["color_mode"] in ("dv81", "dv84") and not Path(cfg["rpu"]).is_file():
             QMessageBox.warning(self, "需要配套杜比元数据", "请提供与最终画面、调色和帧数匹配的 RPU.bin。已有 Dolby Vision 8.4 原片可改用“保留原片”方案。")
             return
-        if cfg["route"] == "preserve" and self.last_report and self.last_report.get("status") == "fail":
+        if cfg["route"] == "preserve" and cfg["delivery"] == "bilibili" and self.last_report and self.last_report.get("status") == "fail":
             QMessageBox.warning(self, "原片还不符合目标格式", "当前原片未满足 B站杜比 8.4 的本地技术检查。请选择“HLG / 8.4 制作”并提供配套 RPU，或使用常规高质量导出。\n\n" + self.last_report.get("summary", ""))
             return
         self.save_preferences()
@@ -927,6 +1454,9 @@ class MainWindow(QMainWindow):
         self.start.setEnabled(False)
         self.resume.setEnabled(False)
         self.check_tools.setEnabled(False)
+        self.import_button.setEnabled(False)
+        self.advanced.setEnabled(False)
+        self.audio_clear.setEnabled(False)
         self.open_output.setEnabled(False)
         self.view_report.setEnabled(False)
         self.output_summary.hide()
@@ -964,8 +1494,10 @@ class MainWindow(QMainWindow):
         self.input_group.setEnabled(True)
         self.param_group.setEnabled(True)
         self.check_tools.setEnabled(True)
+        self.import_button.setEnabled(True)
+        self.advanced.setEnabled(True)
         self.update_control_states()
-        self.start.setEnabled(True)
+        self.refresh_start_state()
         self.pause.setEnabled(False)
         self.stop.setEnabled(False)
         self.refresh_resume()
@@ -977,7 +1509,7 @@ class MainWindow(QMainWindow):
         if kind == "ok":
             self.on_progress(100)
             self.stage_label.setText("导出完成 · 成片已通过本地输出校验")
-            self.top_status.setText("交付完成")
+            self.top_status.setText("导出完成")
             self.last_output = Path(message)
             self.open_output.setEnabled(True)
             self.log.appendPlainText(f"输出文件：{message}")
@@ -1006,6 +1538,7 @@ class MainWindow(QMainWindow):
             self.show_failure(message)
 
     def show_quality_panel(self):
+        self.quality_toggle.setChecked(True)
         QTimer.singleShot(0, lambda: self.content_scroll.ensureWidgetVisible(self.quality_group, 0, 12))
 
     def show_failure(self, message):
@@ -1098,11 +1631,13 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.probe_timer.stop()
-        if self.worker is not None or self.probes:
+        if self.worker is not None or self.probes or self.intakes:
             self.closing = True
             self.stop_processing()
             for probe in self.probes:
                 probe.request_stop()
+            for intake in self.intakes:
+                intake.request_stop()
             self.stage_label.setText("正在安全结束任务，完成后关闭…")
             event.ignore()
             return
@@ -1112,13 +1647,18 @@ class MainWindow(QMainWindow):
 
 def main():
     # Resolve PyQt's actual Unicode installation directory before QApplication.
+    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
+    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps, True)
     plugins = Path(PyQt5.__file__).resolve().parent / "Qt5" / "plugins"
     if plugins.is_dir():
         QApplication.setLibraryPaths([str(plugins)])
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
+    app.setFont(QFont("Microsoft YaHei UI", 12))
+    from app_identity import configure_application
+    configure_application(app)
     window = MainWindow()
-    window.show()
+    window.showMaximized()
     return app.exec_()
 
 

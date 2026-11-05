@@ -34,10 +34,12 @@ class StartupWindow(OriginalWindow):
 
     def verify_and_quit(self):
         assert self.isVisible(), "main() did not show its window"
-        assert self.start.isEnabled(), "new-task control is not ready"
+        assert self.isMaximized() and not self.isFullScreen(), "main() must open a normal maximized window"
+        assert not self.start.isEnabled(), "export should wait until a video has been checked"
         assert self.select_data(self.resolution, (1920, 1080)), "resolution lookup failed"
         assert tuple(self.resolution.currentData()) == (1920, 1080), "wrong restored resolution"
         assert not self.grab().isNull(), "window could not render"
+        self.showNormal()
         self.resize(1000, 640)
         main.QApplication.processEvents()
         assert self.height() <= 680, "layout forces the window off a small display"
@@ -76,6 +78,31 @@ class StartupWindow(OriginalWindow):
         assert "不影响本次常规成片" in self.quality_details.text()
         self.select_data(self.export_preset, "bili_make")
         assert self.config()["color_mode"] == "dv84" and self.rpu.isEnabled()
+        # Smart import must choose a usable native route for codecs MP4 cannot
+        # copy, and make encoder limits visible before a user starts the job.
+        self.vinfo = dict(self.vinfo, codec_name="ffv1", width=192, height=128,
+                          display_width=192, display_height=128, dv_profile=None,
+                          dv_compatibility=None, color_transfer="bt709")
+        self._preset_explicit = False
+        self.choose_source_preset()
+        automatic = self.config()
+        assert automatic["route"] == "transcode" and not automatic["ai"] and not automatic["interp"]
+        assert (automatic["width"], automatic["height"]) == (192, 128)
+        assert "自动转为兼容 MP4" in self.automatic_summary.text()
+        self.select_data(self.fps, 60)
+        assert "保持源尺寸、帧率" not in self.automatic_summary.text(), "manual changes left a misleading automatic summary"
+        self.vinfo.update(width=32, height=24, display_width=32, display_height=24)
+        self.apply_preset()
+        assert not self.start.isEnabled() and "尺寸过小" in self.automatic_summary.text()
+        self.select_data(self.resolution, (1920, 1080))
+        assert self.start.isEnabled(), "choosing a supported size did not allow export"
+        self.select_data(self.export_preset, "enhance")
+        self.choose_source_preset()
+        assert self.export_preset.currentData() == "enhance", "automatic import replaced an explicit preset"
+        self.select_data(self.export_preset, "quality")
+        self.vinfo.update(dv_profile=7)
+        self.update_automatic_summary()
+        assert "不保留原杜比标签" in self.automatic_summary.text()
         # Resume must pass the original persisted config intact, including
         # exact fractional timing and options not represented by a UI control.
         saved_config = {
