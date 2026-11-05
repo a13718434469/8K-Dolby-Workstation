@@ -250,6 +250,36 @@ class CliConfigurationTests(unittest.TestCase):
         for key in ("rpu_mode", "hdr_remaster", "hdr_peak_nits", "source_transfer_override"):
             self.assertNotIn(key, cfg)
 
+    def test_double_dolby_requires_atmos_and_passes_local_encoder_config(self):
+        cfg = self.invoke(["-i", "source.mp4", "--auto-double-dolby",
+                           "--dee-path", "licensed/encoder.exe", "--dee-profile", "licensed/profile.json"])
+        self.assertTrue(cfg["require_atmos"])
+        self.assertEqual((cfg["audio_mode"], cfg["delivery"], cfg["color_mode"]), ("atmos_auto", "bilibili", "dv84"))
+        self.assertEqual((cfg["dee_path"], cfg["dee_profile"]), ("licensed/encoder.exe", "licensed/profile.json"))
+        self.assertFalse(cfg["cloud_atmos"]["allow_upload"])
+
+    def test_double_dolby_rejects_ordinary_audio_and_conflicting_targets(self):
+        for options in (["--audio-mode", "aac"], ["--auto-dolby"], ["--color", "hlg"],
+                        ["--allow-cloud-upload"]):
+            with self.subTest(options=options), self.assertRaises(SystemExit) as error:
+                self.invoke(["-i", "source.mp4", "--auto-double-dolby", *options])
+            self.assertEqual(error.exception.code, 2)
+
+    def test_cloud_encoding_and_resume_require_explicit_upload_option(self):
+        options = ["-i", "source.mp4", "--auto-double-dolby", "--atmos-backend", "aws",
+                   "--aws-region", "ap-southeast-1", "--aws-bucket", "private-audio",
+                   "--aws-role-arn", "arn:aws:iam::123456789012:role/MediaConvert", "--aws-profile", "workstation"]
+        cfg = self.invoke(options)
+        self.assertFalse(cfg["cloud_atmos"]["allow_upload"])
+        allowed = self.invoke(options + ["--allow-cloud-upload"])
+        self.assertTrue(allowed["cloud_atmos"]["allow_upload"])
+        self.assertEqual(allowed["cloud_atmos"]["profile"], "workstation")
+        resumed = self.invoke(["--resume"], checkpoint={"cfg": allowed})
+        self.assertFalse(resumed["cloud_atmos"]["allow_upload"], "a saved job must not grant new cloud spending")
+        self.assertTrue(allowed["cloud_atmos"]["allow_upload"], "resume modified the original checkpoint dictionary")
+        resumed = self.invoke(["--resume", "--allow-cloud-upload"], checkpoint={"cfg": allowed})
+        self.assertTrue(resumed["cloud_atmos"]["allow_upload"])
+
     def test_auto_dolby_caps_native_size_and_fps_without_ai(self):
         cfg = self.invoke(["-i", "source.mp4", "--auto-dolby"],
                           {"width": 7680, "height": 4320, "display_width": 7680, "display_height": 4320,

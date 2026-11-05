@@ -1,7 +1,7 @@
 """Inspect media and report local Dolby/Bilibili readiness without certification claims.
 
-The published Bilibili guidance cited below is dated 2021. Local conformance is
-useful evidence, but the platform's own transcoding result remains authoritative.
+The cited Bilibili video guidance dates from 2021; its audio help was updated in
+2024 and retrieved in 2026. Local conformance does not establish platform approval.
 This module has no GUI dependency and does not import the processing pipeline.
 """
 from __future__ import annotations
@@ -24,11 +24,18 @@ SOURCES = [{
     "url": "https://www.bilibili.com/opus/560508706903943321",
     "published_date": "2021-11-22",
 }, {
+    "title": "哔哩哔哩帮助中心：杜比全景声规格与投稿方式（问题 3792、3794）",
+    "url": "https://www.bilibili.com/blackboard/help.html#/?qid=300&pid=297",
+    "api_url": "https://api.bilibili.com/x/web-goblin/help/detail?questionTypeId=300&ps=20&version=1",
+    "updated_date": "2024-09-25",
+    "retrieved_date": "2026-11-06",
+}, {
     "title": "Dolby Vision for video sharing services: FAQs",
     "url": "https://professionalsupport.dolby.com/s/article/Dolby-Vision-for-video-sharing-services-FAQs?language=en_US",
     "published_date": "2024-03-26",
 }]
-GUIDANCE_NOTE = ("依据 B 站已公开的 2021 年投稿指引检查本地格式；该文档不是当前平台的完整验收规范。"
+GUIDANCE_NOTE = ("画面参照 B 站 2021 年杜比视界投稿指引；音频参照 2024-09-25 更新、2026-11-06 仍公开提供的杜比全景声帮助。"
+                 "这些资料不是当前平台的完整验收规范。"
                  "本地检查不会证明平台已识别杜比，仍需创作中心转码结果和支持设备上的回放验收。")
 
 
@@ -104,6 +111,18 @@ def _number(value, default=0.0):
         return default
 
 
+def _audio_bit_rate(first_audio, streams, fmt):
+    """Use a track bitrate; a container total is valid only for one audio stream."""
+    bitrate = _integer(first_audio.get("bit_rate"), 0)
+    if bitrate > 0:
+        return bitrate
+    # Never mistake a video/container bitrate (or the sum of several audio
+    # streams) for the bitrate of the selected first audio track.
+    if len(streams) == 1 and streams[0] is first_audio:
+        return max(0, _integer(fmt.get("bit_rate"), 0))
+    return 0
+
+
 def _positive_rate(*values):
     for value in values:
         try:
@@ -170,13 +189,20 @@ def read_probe(data, path=""):
         raise QualityError("文件不包含可用视频轨道")
     fmt = data.get("format") or {}
     rate = _positive_rate(video.get("avg_frame_rate"), video.get("r_frame_rate"))
-    duration = _number(video.get("duration")) or _number(fmt.get("duration"))
+    duration = _number(video.get("duration"))
+    duration_source = "stream"
     if duration <= 0:
-        # Some elementary streams expose only duration_ts and time_base.
+        # A container total can include delayed starts or longer audio/subtitle
+        # tracks. Prefer this video's own clock before considering that total.
         try:
             duration = float(Fraction(str(video.get("time_base"))) * int(video.get("duration_ts")))
+            duration_source = "stream_time_base"
         except (ValueError, TypeError, ZeroDivisionError):
             pass
+    duration_exact_from_stream = duration > 0 and math.isfinite(duration)
+    if not duration_exact_from_stream:
+        duration = _number(fmt.get("duration"))
+        duration_source = "container_estimate"
     if duration <= 0 or not math.isfinite(duration):
         raise QualityError("视频没有有效时长")
     width, height = _integer(video.get("width"), 0), _integer(video.get("height"), 0)
@@ -206,6 +232,8 @@ def read_probe(data, path=""):
         "width": width, "height": height, "fps": float(rate), "fps_fraction": str(rate),
         "rotation": rotation, "display_width": display_width, "display_height": display_height,
         "duration": duration, "total_frames": count, "frame_count_exact": exact_count,
+        "duration_exact_from_stream": duration_exact_from_stream,
+        "duration_exact": duration_exact_from_stream, "duration_source": duration_source,
         "codec_name": video.get("codec_name", "unknown"), "pix_fmt": video.get("pix_fmt", "unknown"),
         "bit_depth": _bit_depth(video), "color_transfer": video.get("color_transfer", "unknown"),
         "color_primaries": video.get("color_primaries", "unknown"), "color_space": video.get("color_space", "unknown"),
@@ -220,6 +248,7 @@ def read_probe(data, path=""):
         "audio_profile": first_audio.get("profile", "unknown") if audio else "none",
         "audio_channels": _integer(first_audio.get("channels"), 0),
         "audio_sample_rate": _integer(first_audio.get("sample_rate"), 0),
+        "audio_bit_rate": _audio_bit_rate(first_audio, streams, fmt),
         "audio_duration": _number(first_audio.get("duration")),
         "atmos": atmos, "atmos_evidence": evidence,
         "audio_streams": audio, "stream": video, "format": fmt,
@@ -256,6 +285,7 @@ def read_audio_probe(data, path=""):
     return {"path": str(path), "filename": Path(path).name if path else "",
             "audio_codec": first.get("codec_name", "unknown"), "audio_profile": first.get("profile", "unknown"),
             "audio_channels": _integer(first.get("channels"), 0), "audio_sample_rate": _integer(first.get("sample_rate"), 0),
+            "audio_bit_rate": _audio_bit_rate(first, streams, fmt),
             "audio_duration": _number(first.get("duration")) or _number(fmt.get("duration")),
             "duration": _number(first.get("duration")) or _number(fmt.get("duration")),
             "atmos": atmos, "atmos_evidence": evidence, "audio_streams": audio, "format": fmt,
@@ -301,6 +331,8 @@ def inspect_media(path, *, ffprobe=None, mediainfo=None, count_frames=False, can
         command.append("-count_frames")
     command += ["-show_streams", "-show_format", "-of", "json", str(path)]
     info = read_probe(_run_json(command, timeout=None if count_frames else 90, cancel_event=cancel_event), path)
+    if not info["duration_exact_from_stream"]:
+        _complete_packet_duration(info, ffprobe, path, cancel_event)
     _complete_frame_colors(info, ffprobe, path, cancel_event)
     media_tool = mediainfo if mediainfo is not None else _tool("mediainfo")
     if media_tool and info["audio_codec"] in ("eac3", "truehd"):
@@ -313,6 +345,108 @@ def inspect_media(path, *, ffprobe=None, mediainfo=None, count_frames=False, can
             # but it must not silently turn an unknown Atmos stream into a pass.
             info["inspection_notes"].append(str(exc))
     return info
+
+
+def _scan_packet_duration(command, *, fallback_frame_duration, timeout=300, cancel_event=None):
+    """Scan bounded-memory packet timestamps; all temporary files close on cancel."""
+    options = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+    process = None
+    started = time.monotonic()
+    with tempfile.TemporaryFile() as output, tempfile.TemporaryFile() as errors:
+        try:
+            if cancel_event is not None and cancel_event.is_set():
+                raise QualityCancelled("媒体检测已停止")
+            process = subprocess.Popen([str(x) for x in command], stdout=output, stderr=errors, **options)
+            while process.poll() is None:
+                if cancel_event is not None and cancel_event.is_set():
+                    raise QualityCancelled("媒体检测已停止")
+                if time.monotonic() - started >= timeout:
+                    raise QualityError(f"视频时间戳检测超过 {timeout:g} 秒，已终止检测工具")
+                if cancel_event is not None:
+                    cancel_event.wait(0.1)
+                else:
+                    time.sleep(0.1)
+            if cancel_event is not None and cancel_event.is_set():
+                raise QualityCancelled("媒体检测已停止")
+            if process.returncode:
+                errors.seek(0, os.SEEK_END)
+                errors.seek(max(0, errors.tell() - 1800))
+                raise QualityError("视频时间戳检测失败: " + errors.read().decode("utf-8", "replace").strip())
+        except OSError as exc:
+            raise QualityError(f"视频时间戳检测工具无法运行: {exc}") from exc
+        finally:
+            if process is not None and process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+        output.seek(0)
+        minimum = maximum = previous_maximum = None
+        maximum_has_duration = False
+        known_end = None
+        packets = missing_pts = 0
+        for line in output:
+            if cancel_event is not None and cancel_event.is_set():
+                raise QualityCancelled("媒体检测已停止")
+            fields = dict(part.split("=", 1) for part in line.decode("utf-8", "replace").strip().split("|") if "=" in part)
+            if not fields:
+                continue
+            packets += 1
+            pts = _number(fields.get("pts_time"), None)
+            duration = _number(fields.get("duration_time"))
+            if pts is None:
+                missing_pts += 1
+                continue
+            minimum = pts if minimum is None else min(minimum, pts)
+            if maximum is None or pts > maximum:
+                previous_maximum, maximum = maximum, pts
+                maximum_has_duration = duration > 0
+            elif pts == maximum:
+                maximum_has_duration = maximum_has_duration or duration > 0
+            elif previous_maximum is None or pts > previous_maximum:
+                previous_maximum = pts
+            if duration > 0:
+                end = pts + duration
+                known_end = end if known_end is None else max(known_end, end)
+        if minimum is None or maximum is None:
+            raise QualityError("视频缺少可用 PTS，无法确定实际画面时长")
+        exact = maximum_has_duration and not missing_pts
+        end = known_end
+        if not maximum_has_duration:
+            interval = maximum - previous_maximum if previous_maximum is not None else fallback_frame_duration
+            if not math.isfinite(interval) or interval <= 0:
+                raise QualityError("视频最后一帧缺少时长，无法确定画面结束时间")
+            end = max(known_end or maximum, maximum + interval)
+        if end is None or not math.isfinite(end - minimum) or end <= minimum:
+            raise QualityError("视频时间戳没有有效的画面时间跨度")
+        return {"start": minimum, "end": end, "duration": end - minimum,
+                "exact": exact, "packets": packets, "missing_pts": missing_pts,
+                "last_duration_estimated": not maximum_has_duration}
+
+
+def _complete_packet_duration(info, ffprobe, path, cancel_event):
+    """Replace a container-length estimate with the selected video's PTS span."""
+    index = _integer(info["stream"].get("index"))
+    if index is None or index < 0:
+        raise QualityError("视频缺少有效轨道索引，无法确认实际画面时长")
+    result = _scan_packet_duration(
+        [ffprobe, "-v", "error", "-select_streams", str(index), "-show_packets",
+         "-show_entries", "packet=pts_time,duration_time", "-of", "compact=p=0:nk=0", str(path)],
+        fallback_frame_duration=1 / float(Fraction(info["fps_fraction"])), cancel_event=cancel_event)
+    info["duration"] = result["duration"]
+    info["duration_exact"] = result["exact"]
+    info["duration_source"] = "packet_timestamps" if result["exact"] else "estimated_packet_timestamps"
+    info["video_timeline"] = result
+    if not info["frame_count_exact"]:
+        info["total_frames"] = max(1, round(result["duration"] * Fraction(info["fps_fraction"])))
+    detail = f"按视频轨道 {index} 的实际 PTS 范围计算画面时长 {result['duration']:.6f}s，不使用容器总长"
+    if result["last_duration_estimated"]:
+        detail += "；最后一帧缺少时长，按相邻 PTS 间隔估计，不能视为精确时长"
+    if result["missing_pts"]:
+        detail += f"；{result['missing_pts']} 个包缺少 PTS，时间跨度仍是估计"
+    info["inspection_notes"].append(detail)
 
 
 def _complete_frame_colors(info, ffprobe, path, cancel_event):
@@ -367,6 +501,58 @@ def _check(identifier, label, status, detail):
     return {"id": identifier, "label": label, "status": status, "detail": detail}
 
 
+def _atmos_audio_checks(info, *, require_atmos, strict_sample_rate=False):
+    """Keep optional audio warnings separate from video-preservation failures."""
+    failure = "fail" if require_atmos else "warning"
+    codec = str(info.get("audio_codec", "none")).lower()
+    confirmed = info.get("atmos") == "confirmed" and codec == "eac3"
+    evidence = info.get("atmos_evidence") or "未能确认对象音频信息；普通 E-AC-3 或多声道不等同于 Atmos"
+    checks = [_check("atmos", "Atmos 音轨证据", "pass" if confirmed else failure,
+                     "确认第一条音轨包含 E-AC-3 JOC / Atmos 信息；平台双标仍需转码与回放确认"
+                     if confirmed else f"需要已确认的 E-AC-3 JOC；当前编码 {codec}。{evidence}")]
+    channels = _integer(info.get("audio_channels"), 0)
+    checks.append(_check("audio_channels", "Atmos 交付声道", "pass" if channels in (6, 8) else failure,
+                         f"第一条音轨 {channels or '未知'} 声道；B 站要求 6（5.1）或 8（7.1）声道"))
+    bitrate = _integer(info.get("audio_bit_rate"), 0)
+    checks.append(_check("audio_bitrate", "Atmos 音频码率", "pass" if bitrate >= 320_000 else failure,
+                         (f"第一条音轨 {bitrate / 1000:g} kbps；按公开要求检查至少 320 kbps"
+                          if bitrate > 0 else "无法确认第一条音轨码率；需至少 320 kbps，不能用视频总码率代替")))
+    sample_rate = _integer(info.get("audio_sample_rate"), 0)
+    checks.append(_check("audio_sample_rate", "Atmos 音频采样率",
+                         "pass" if sample_rate == 48_000 else "fail" if strict_sample_rate else "warning",
+                         f"第一条音轨 {sample_rate or '未知'} Hz；" +
+                         ("本程序生成的 Atmos 音轨须为 48000 Hz" if strict_sample_rate else "B 站推荐 48000 Hz")))
+    return checks
+
+
+def validate_atmos_audio(info, expected_duration=None, *, strict_sample_rate=True):
+    """Validate a generated JOC track, returning a report rather than raising.
+
+    Requires parsed Atmos evidence, E-AC-3, 6/8 channels and >=320 kbps. Generated
+    audio requires 48 kHz; ``strict_sample_rate=False`` makes this a recommendation
+    for an existing JOC stream that is being copied without re-encoding.
+    When provided, the intended duration may differ by at most 80 ms, allowing
+    E-AC-3 frame padding. This local report does not certify Bilibili acceptance.
+    """
+    checks = _atmos_audio_checks(info, require_atmos=True, strict_sample_rate=strict_sample_rate)
+    duration = _number(info.get("audio_duration"))
+    expected = _number(expected_duration) if expected_duration is not None else None
+    duration_ok = duration > 0
+    detail = f"音轨实际时长 {duration:.6f}s"
+    if expected is not None:
+        delta = abs(duration - expected)
+        duration_ok = duration_ok and expected > 0 and (delta <= 0.08 or math.isclose(delta, 0.08, abs_tol=1e-9))
+        detail += f"；预期 {expected:.6f}s；允许误差不超过 0.080s"
+    checks.append(_check("audio_duration", "Atmos 音轨时长", "pass" if duration_ok else "fail", detail))
+    failed = any(item["status"] == "fail" for item in checks)
+    warned = any(item["status"] == "warning" for item in checks)
+    status = "fail" if failed else "warning" if warned else "pass"
+    summary = ("；".join(item["detail"] for item in checks if item["status"] == "fail") if failed else
+               "；".join(item["detail"] for item in checks if item["status"] == "warning") + "；平台识别尚未验收" if warned else
+               "Atmos 音轨本地检查通过；平台识别尚未验收")
+    return {"status": status, "checks": checks, "summary": summary}
+
+
 def assess_bilibili(info, require_atmos=False):
     """Assess the published Dolby Vision upload profile, never platform approval."""
     checks = []
@@ -406,20 +592,7 @@ def assess_bilibili(info, require_atmos=False):
     checks.append(_check("bitrate_guidance", "码率参考", "pass" if bitrate >= 30_000_000 else "warning",
                          (f"检测到约 {bitrate / 1_000_000:.2f} Mbps；官方建议约 30 Mbps。码率不是画质或平台通过的保证"
                           if bitrate else "无法确定视频码率；官方建议约 30 Mbps，需结合画面复杂度和肉眼检查")))
-    atmos = info.get("atmos", "unknown")
-    codec_audio = info.get("audio_codec", "none")
-    if atmos == "confirmed" and codec_audio == "eac3":
-        audio_status = "pass"
-        audio_detail = "确认第一条音轨包含 E-AC-3 JOC / Atmos 信息；能否获得平台双标仍需转码与回放确认"
-    else:
-        audio_status = "fail" if require_atmos else "warning"
-        if atmos == "confirmed":
-            audio_detail = f"确认 Atmos，但音轨为 {codec_audio}；B 站双标交付应保留受支持的 E-AC-3 JOC 码流"
-        elif codec_audio == "none":
-            audio_detail = "文件没有音轨；无法作为 Atmos 双标素材"
-        else:
-            audio_detail = info.get("atmos_evidence", "未能确认 Atmos；普通 E-AC-3 或多声道不等同于 Atmos")
-    checks.append(_check("atmos", "Atmos 音轨证据", audio_status, audio_detail))
+    checks.extend(_atmos_audio_checks(info, require_atmos=require_atmos))
     failed = any(item["status"] == "fail" for item in checks)
     warned = any(item["status"] == "warning" for item in checks)
     status = "fail" if failed else "warning" if warned else "pass"

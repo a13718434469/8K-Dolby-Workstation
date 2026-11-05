@@ -32,11 +32,32 @@ def fixture():
         }, {
             "index": 1, "codec_type": "audio", "codec_name": "eac3", "channels": 6,
             "profile": "Dolby Digital Plus + Dolby Atmos", "sample_rate": "48000", "duration": "2.002",
+            "bit_rate": "768000",
         }],
     }
 
 
 class ProbeNormalizationTests(unittest.TestCase):
+    def test_video_clock_duration_precedes_longer_container_duration(self):
+        data = fixture()
+        video = data["streams"][0]
+        video.pop("duration")
+        video.update(duration_ts=1001, time_base="1/1000")
+        data["format"]["duration"] = "40"
+        info = quality.read_probe(data)
+        self.assertAlmostEqual(info["duration"], 1.001)
+        self.assertTrue(info["duration_exact_from_stream"])
+        self.assertTrue(info["duration_exact"])
+        self.assertEqual(info["duration_source"], "stream_time_base")
+
+    def test_container_duration_fallback_is_identified_as_an_estimate(self):
+        data = fixture()
+        data["streams"][0].pop("duration")
+        info = quality.read_probe(data)
+        self.assertFalse(info["duration_exact_from_stream"])
+        self.assertFalse(info["duration_exact"])
+        self.assertEqual(info["duration_source"], "container_estimate")
+
     def test_preserves_exact_fractional_rate_and_dolby_flags(self):
         info = quality.read_probe(fixture(), "movie with spaces.mp4")
         self.assertEqual(Fraction(info["fps_fraction"]), Fraction(30000, 1001))
@@ -224,8 +245,169 @@ class ReadinessTests(unittest.TestCase):
             self.assertEqual(list(target.parent.glob("*.tmp")), [])
 
 
+class AtmosDeliveryTests(unittest.TestCase):
+    def audio_info(self, **overrides):
+        data = fixture()
+        data["streams"] = data["streams"][1:]
+        data["streams"][0].update(overrides)
+        return quality.read_audio_probe(data)
+
+    def test_bitrate_is_from_first_audio_track_not_video_or_later_tracks(self):
+        data = fixture()
+        data["streams"].append({"codec_type": "audio", "codec_name": "eac3", "bit_rate": "1024000"})
+        self.assertEqual(quality.read_probe(data)["audio_bit_rate"], 768000)
+        del data["streams"][1]["bit_rate"]
+        self.assertEqual(quality.read_probe(data)["audio_bit_rate"], 0)
+        self.assertEqual(quality.read_audio_probe(data)["audio_bit_rate"], 0)
+        report = quality.assess_bilibili(quality.read_probe(data), require_atmos=True)
+        self.assertEqual(next(c for c in report["checks"] if c["id"] == "audio_bitrate")["status"], "fail")
+
+    def test_container_bitrate_fallback_requires_one_audio_stream_and_no_video(self):
+        data = fixture()
+        data["streams"] = data["streams"][1:]
+        data["streams"][0].pop("bit_rate")
+        data["format"]["bit_rate"] = "384000"
+        self.assertEqual(quality.read_audio_probe(data)["audio_bit_rate"], 384000)
+        first = copy.deepcopy(data["streams"][0])
+        for other in (first, {"codec_type": "video", "disposition": {"attached_pic": 1}}, {}):
+            with self.subTest(other=other):
+                mixed = copy.deepcopy(data)
+                mixed["streams"].append(other)
+                self.assertEqual(quality.read_audio_probe(mixed)["audio_bit_rate"], 0)
+
+    def test_bili_atmos_requirements_are_hard_only_when_required(self):
+        for changes, failed_id in (({"channels": 2}, "audio_channels"),
+                                   ({"channels": 10}, "audio_channels"),
+                                   ({"bit_rate": "319999"}, "audio_bitrate"),
+                                   ({"bit_rate": "N/A"}, "audio_bitrate"),
+                                   ({"profile": "E-AC-3"}, "atmos"),
+                                   ({"codec_name": "truehd"}, "atmos")):
+            with self.subTest(changes=changes):
+                data = fixture()
+                data["streams"][1].update(changes)
+                info = quality.read_probe(data)
+                required = quality.assess_bilibili(info, require_atmos=True)
+                self.assertEqual(next(c for c in required["checks"] if c["id"] == failed_id)["status"], "fail")
+                optional = quality.assess_bilibili(info, require_atmos=False)
+                self.assertEqual(optional["status"], "warning")
+                self.assertFalse(any(c["status"] == "fail" for c in optional["checks"]),
+                                 "optional audio must not disable valid Dolby Vision preservation")
+
+    def test_48khz_is_recommended_for_upload_but_required_for_generated_audio(self):
+        data = fixture()
+        data["streams"][1]["sample_rate"] = "44100"
+        info = quality.read_probe(data)
+        upload = quality.assess_bilibili(info, require_atmos=True)
+        self.assertEqual(upload["status"], "warning")
+        self.assertEqual(quality.validate_atmos_audio(info)["status"], "fail")
+
+    def test_generated_audio_accepts_six_or_eight_channels_and_320kbps_boundary(self):
+        for channels in (6, 8):
+            with self.subTest(channels=channels):
+                report = quality.validate_atmos_audio(self.audio_info(channels=channels, bit_rate="320000"), 2.002)
+                self.assertEqual(report["status"], "pass")
+                self.assertTrue(all(c["status"] == "pass" for c in report["checks"]))
+                self.assertIn("平台识别尚未验收", report["summary"])
+
+    def test_existing_44100_joc_can_be_preserved_with_sample_rate_warning(self):
+        report = quality.validate_atmos_audio(self.audio_info(sample_rate="44100"), strict_sample_rate=False)
+        self.assertEqual(report["status"], "warning")
+        self.assertEqual({c["id"] for c in report["checks"] if c["status"] != "pass"}, {"audio_sample_rate"})
+
+    def test_preservation_sample_rate_exception_does_not_waive_other_requirements(self):
+        for change in ({"audio_codec": "aac"}, {"atmos": "unknown"}, {"audio_channels": 2},
+                       {"audio_bit_rate": 319999}, {"audio_duration": 0.5}):
+            with self.subTest(change=change):
+                info = self.audio_info(sample_rate="44100")
+                info.update(change)
+                report = quality.validate_atmos_audio(info, 2.002, strict_sample_rate=False)
+                self.assertEqual(report["status"], "fail")
+
+    def test_generated_audio_rejects_fake_titles_plain_eac3_and_non_joc_codecs(self):
+        for changes in ({"profile": "E-AC-3", "tags": {"title": "Dolby Atmos JOC"}},
+                        {"profile": "unknown"}, {"codec_name": "truehd"},
+                        {"codec_name": "aac"}):
+            with self.subTest(changes=changes):
+                report = quality.validate_atmos_audio(self.audio_info(**changes), 2.002)
+                self.assertEqual(next(c for c in report["checks"] if c["id"] == "atmos")["status"], "fail")
+
+    def test_generated_audio_rejects_wrong_channels_bitrate_and_sample_rate(self):
+        for key, values in (("audio_channels", (0, 2, 10)),
+                            ("audio_bit_rate", (0, 319999, None, "N/A")),
+                            ("audio_sample_rate", (0, 44100, 96000))):
+            for value in values:
+                with self.subTest(key=key, value=value):
+                    info = self.audio_info()
+                    info[key] = value
+                    self.assertEqual(quality.validate_atmos_audio(info, 2.002)["status"], "fail")
+
+    def test_generated_audio_duration_allows_codec_padding_but_not_sync_errors(self):
+        for duration, passed in ((1.936, True), (2.064, True), (2.08, True),
+                                 (1.92, True), (2.08001, False), (1.91999, False),
+                                 (0, False), (float("nan"), False), (float("inf"), False)):
+            with self.subTest(duration=duration):
+                info = self.audio_info()
+                info["audio_duration"] = duration
+                report = quality.validate_atmos_audio(info, expected_duration=2.0)
+                self.assertEqual(report["status"], "pass" if passed else "fail")
+        for expected in (0, -1, float("nan"), float("inf")):
+            with self.subTest(expected=expected):
+                self.assertEqual(quality.validate_atmos_audio(self.audio_info(), expected)["status"], "fail")
+        info = self.audio_info()
+        del info["audio_duration"]
+        info["duration"] = 2.002
+        self.assertEqual(quality.validate_atmos_audio(info)["status"], "fail", "video duration cannot prove audio duration")
+
+    def test_audio_guidance_records_update_and_retrieval_dates_separately(self):
+        audio_source = next(item for item in quality.SOURCES if "3792" in item["title"])
+        self.assertEqual(audio_source["updated_date"], "2024-09-25")
+        self.assertEqual(audio_source["retrieved_date"], "2026-11-06")
+        self.assertIn("2021", quality.GUIDANCE_NOTE)
+        self.assertIn("2024-09-25", quality.GUIDANCE_NOTE)
+
+
 @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg required")
 class ActualMediaTests(unittest.TestCase):
+    def test_packet_duration_excludes_video_start_offset_and_longer_audio(self):
+        with tempfile.TemporaryDirectory() as temp:
+            for audio_duration in (0.7, 2.0):
+                with self.subTest(audio_duration=audio_duration):
+                    path = Path(temp) / f"nonzero-video-start-{audio_duration}.mkv"
+                    command = [shutil.which("ffmpeg"), "-v", "error", "-itsoffset", "0.2", "-f", "lavfi", "-i",
+                               "color=size=64x48:rate=10:duration=0.5", "-f", "lavfi", "-i",
+                               f"sine=sample_rate=48000:duration={audio_duration}", "-map", "0:v:0", "-map", "1:a:0",
+                               "-c:v", "libx264", "-bf", "2", "-c:a", "pcm_s16le", str(path)]
+                    encoded = subprocess.run(command, capture_output=True, text=True, timeout=30)
+                    self.assertEqual(encoded.returncode, 0, encoded.stderr)
+                    info = quality.inspect_media(path, mediainfo="", count_frames=True)
+                    self.assertAlmostEqual(float(info["stream"]["start_time"]), 0.2)
+                    self.assertGreater(float(info["format"]["duration"]), 0.5)
+                    self.assertAlmostEqual(info["duration"], 0.5, places=6)
+                    self.assertFalse(info["duration_exact_from_stream"])
+                    self.assertTrue(info["duration_exact"])
+                    self.assertEqual(info["duration_source"], "packet_timestamps")
+                    self.assertEqual(info["total_frames"], 5)
+                    self.assertTrue(info["frame_count_exact"])
+
+    def test_vfr_packet_span_is_independent_of_frame_count_and_nominal_fps(self):
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "VFR with B frames and longer audio.mkv"
+            command = [shutil.which("ffmpeg"), "-v", "error", "-itsoffset", "0.4", "-f", "lavfi", "-i",
+                       "testsrc2=size=64x48:rate=10:duration=1.6", "-f", "lavfi", "-i",
+                       "sine=sample_rate=48000:duration=3", "-map", "0:v:0", "-map", "1:a:0",
+                       "-vf", r"select=eq(n\,0)+eq(n\,1)+eq(n\,4)+eq(n\,10)+eq(n\,15)",
+                       "-fps_mode", "vfr", "-c:v", "libx264", "-bf", "2", "-c:a", "pcm_s16le", str(path)]
+            encoded = subprocess.run(command, capture_output=True, text=True, timeout=30)
+            self.assertEqual(encoded.returncode, 0, encoded.stderr)
+            info = quality.inspect_media(path, mediainfo="", count_frames=True)
+            self.assertAlmostEqual(info["duration"], 1.6, places=6)
+            self.assertAlmostEqual(info["video_timeline"]["start"], 0.4, places=6)
+            self.assertAlmostEqual(info["video_timeline"]["end"], 2.0, places=6)
+            self.assertEqual(info["total_frames"], 5)
+            self.assertTrue(info["frame_count_exact"])
+            self.assertTrue(info["duration_exact"])
+            self.assertNotAlmostEqual(info["duration"], info["total_frames"] / info["fps"])
+
     def test_real_hlg_matroska_with_b_frames_reports_decoded_vui_colors(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp).resolve() / "HLG with delayed frames.mkv"
@@ -286,6 +468,75 @@ class ActualMediaTests(unittest.TestCase):
 
 
 class InspectionControlTests(unittest.TestCase):
+    def packet_scan(self, content):
+        return quality._scan_packet_duration(
+            [sys.executable, "-c", "import sys; sys.stdout.write(" + repr(content) + ")"],
+            fallback_frame_duration=0.04)
+
+    def test_packet_duration_handles_reordered_pts_and_exposes_estimated_last_duration(self):
+        exact = self.packet_scan("pts_time=1.0|duration_time=0.1\npts_time=1.4|duration_time=0.2\npts_time=1.1|duration_time=0.3\n")
+        self.assertAlmostEqual(exact["duration"], 0.6)
+        self.assertTrue(exact["exact"])
+        estimated = self.packet_scan("pts_time=1.0|duration_time=0.1\npts_time=1.4|duration_time=N/A\npts_time=1.1|duration_time=0.3\n")
+        self.assertAlmostEqual(estimated["duration"], 0.7)
+        self.assertFalse(estimated["exact"])
+        self.assertTrue(estimated["last_duration_estimated"])
+
+    def test_packet_duration_missing_pts_cannot_claim_exact_timing(self):
+        result = self.packet_scan("pts_time=0.0|duration_time=0.1\npts_time=N/A|duration_time=0.1\n")
+        self.assertFalse(result["exact"])
+        self.assertEqual(result["missing_pts"], 1)
+        with self.assertRaisesRegex(quality.QualityError, "PTS"):
+            self.packet_scan("pts_time=N/A|duration_time=0.1\n")
+
+    def test_packet_duration_updates_only_estimated_frame_count_and_targets_video_index(self):
+        data = fixture()
+        video = data["streams"][0]
+        video.pop("duration")
+        video.pop("nb_frames")
+        video["index"] = 3
+        info = quality.read_probe(data)
+        result = {"duration": 0.5, "start": 0.2, "end": 0.7, "exact": True,
+                  "packets": 5, "missing_pts": 0, "last_duration_estimated": False}
+        with patch.object(quality, "_scan_packet_duration", return_value=result) as scan:
+            quality._complete_packet_duration(info, "ffprobe", "placeholder.mkv", None)
+        self.assertEqual(info["total_frames"], round(0.5 * Fraction(info["fps_fraction"])))
+        self.assertFalse(info["frame_count_exact"])
+        command = scan.call_args.args[0]
+        self.assertEqual(command[command.index("-select_streams") + 1], "3")
+        info.update(total_frames=5, frame_count_exact=True)
+        with patch.object(quality, "_scan_packet_duration", return_value=result):
+            quality._complete_packet_duration(info, "ffprobe", "placeholder.mkv", None)
+        self.assertEqual(info["total_frames"], 5)
+
+    def test_packet_probe_cancel_and_timeout_close_files_and_reap_process(self):
+        for cancelled in (True, False):
+            with self.subTest(cancelled=cancelled):
+                children, handles = [], []
+                cancel = threading.Event()
+                real_popen, real_tempfile = subprocess.Popen, tempfile.TemporaryFile
+
+                def launch(*args, **kwargs):
+                    child = real_popen(*args, **kwargs)
+                    children.append(child)
+                    if cancelled:
+                        cancel.set()
+                    return child
+
+                def temporary(*args, **kwargs):
+                    handle = real_tempfile(*args, **kwargs)
+                    handles.append(handle)
+                    return handle
+
+                with patch.object(quality.subprocess, "Popen", side_effect=launch), \
+                        patch.object(quality.tempfile, "TemporaryFile", side_effect=temporary):
+                    with self.assertRaises(quality.QualityCancelled if cancelled else quality.QualityError):
+                        quality._scan_packet_duration([sys.executable, "-c", "import time; time.sleep(30)"],
+                                                      fallback_frame_duration=0.04, timeout=0.1, cancel_event=cancel)
+                self.assertIsNotNone(children[0].poll())
+                self.assertEqual(len(handles), 2)
+                self.assertTrue(all(handle.closed for handle in handles))
+
     def test_frame_color_fallback_targets_main_video_and_keeps_explicit_values(self):
         data = fixture()
         video = data["streams"][0]

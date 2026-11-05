@@ -21,7 +21,7 @@ from pipeline import (
     find_rife_model, find_tool, load_checkpoint, probe_video,
 )
 
-VERSION = "2.3"
+VERSION = "2.4"
 
 
 def ai_tools_available():
@@ -254,9 +254,10 @@ class ProcessThread(QThread):
 
 class MainWindow(QMainWindow):
     PRESETS = {
+        "bili_dual": ("B站双杜比 · 自动制作（推荐）", "制作 Dolby Vision 8.4 和真正的 Atmos 音轨。已有合规码流直接保留；普通音轨通过已配置的 Atmos 编码器制作。成片严格检查两种格式，平台双标仍需投稿后验收。"),
         "preserve": ("原片保留（不重新编码）", "不重编码视频，保持原始分辨率、帧率和色彩。"),
         "bili_preserve": ("B站杜比 · 保留原片", "保留已有 Dolby Vision 8.4 与原始码流。优先保障画质，有现成 Atmos 就原样保留。"),
-        "bili_make": ("B站杜比 · 自动制作（推荐）", "自动制作 HLG / Dolby Vision 8.4，逐帧分析最终画面生成杜比元数据。普通 SDR 自动扩展 HDR 亮度，已有 HDR 不二次扩展；平台识别仍需转码验收。"),
+        "bili_make": ("仅杜比视界 · 自动制作", "自动制作 HLG / Dolby Vision 8.4，逐帧分析最终画面生成杜比元数据。此方案不要求 Atmos；需要画面与声音双杜比时请选择“双杜比”。"),
         "quality": ("高质量常规导出", "原生精度处理，默认保留源分辨率和帧率。适合 SDR、HDR10 与 HLG 内容制作。"),
         "enhance": ("AI 增强 · 插帧与超分", "按需启用 AI。此路径使用 8-bit SDR RGB 工作帧；HDR 母版推荐选择原片保留或高质量导出。"),
     }
@@ -296,6 +297,8 @@ class MainWindow(QMainWindow):
         self._preserve_restored_settings = False
         self._smart_native_conversion = False
         self._hdr_peak_nits = 600
+        self._atmos_status_cache = None
+        self._readiness_notice = None
         self.settings_file = WORKSPACE / "ui_preferences.json"
         self.sr_available, self.interp_available = ai_tools_available()
         self.setStyleSheet(self.stylesheet())
@@ -421,6 +424,10 @@ class MainWindow(QMainWindow):
         self.automatic_summary.setObjectName("automaticSummary")
         self.automatic_summary.setWordWrap(True)
         export.addWidget(self.automatic_summary)
+        self.atmos_setup = QPushButton("Atmos 编码设置…")
+        self.atmos_setup.setToolTip("首次制作 Atmos 时配置本地编码器或云端服务；已有合规 Atmos 可直接保留。")
+        self.atmos_setup.clicked.connect(self.show_atmos_settings)
+        export.addWidget(self.atmos_setup)
         self.preset_note = QLabel()
         self.preset_note.setObjectName("muted")
         self.preset_note.setWordWrap(True)
@@ -495,7 +502,7 @@ class MainWindow(QMainWindow):
                              ("杜比视界 8.4 · HLG", "dv84"), ("杜比视界 8.1 · PQ", "dv81")]:
             self.color.addItem(label, value)
         self.audio_mode = SafeComboBox()
-        for label, value in [("复制音轨（保留已有 Atmos）", "copy"), ("AAC", "aac"), ("E-AC-3（普通多声道）", "eac3"), ("不保留音轨", "none")]:
+        for label, value in [("自动 Atmos（生成或保留）", "atmos_auto"), ("复制音轨（保留已有 Atmos）", "copy"), ("AAC", "aac"), ("E-AC-3（普通多声道）", "eac3"), ("不保留音轨", "none")]:
             self.audio_mode.addItem(label, value)
         self.ai = QCheckBox("启用超分")
         self.interp = QCheckBox("启用插帧")
@@ -557,6 +564,56 @@ class MainWindow(QMainWindow):
         advanced.addWidget(QLabel("每批帧数"), 6, 0)
         advanced.addWidget(self.batch_size, 6, 1)
         advanced.addWidget(self.clean, 6, 2, 1, 2)
+        self.atmos_group = QGroupBox("Atmos 编码设置")
+        atmos_layout = QVBoxLayout(self.atmos_group)
+        self.atmos_backend = SafeComboBox()
+        self.atmos_backend.addItem("本地 Dolby Encoding Engine", "dee")
+        self.atmos_backend.addItem("AWS MediaConvert 云端编码", "aws")
+        atmos_layout.addWidget(self.atmos_backend)
+        self.dee_fields = QWidget()
+        dee_layout = QGridLayout(self.dee_fields)
+        dee_layout.setContentsMargins(0, 0, 0, 0)
+        self.dee_path = FileField("已授权 DEE 编码程序；留空从安装位置查找", "编码程序 (*.exe);;所有文件 (*)")
+        self.dee_profile = FileField("与本机 DEE 版本匹配的命令配置", "编码配置 (*.json)")
+        dee_layout.addWidget(QLabel("编码程序"), 0, 0)
+        dee_layout.addWidget(self.dee_path, 0, 1)
+        dee_layout.addWidget(QLabel("编码配置文件"), 1, 0)
+        dee_layout.addWidget(self.dee_profile, 1, 1)
+        dee_note = QLabel("需要完整 DEE 及有效许可证，编码配置须对应安装版本。程序不会附带许可证；配置就绪后仍会验证实际输出是否为 Atmos。")
+        dee_note.setWordWrap(True)
+        dee_note.setObjectName("muted")
+        dee_layout.addWidget(dee_note, 2, 0, 1, 2)
+        atmos_layout.addWidget(self.dee_fields)
+        self.aws_fields = QWidget()
+        aws_layout = QGridLayout(self.aws_fields)
+        aws_layout.setContentsMargins(0, 0, 0, 0)
+        self.aws_inputs = {}
+        for row, (key, title, placeholder) in enumerate((
+            ("region", "AWS 区域", "例如 ap-southeast-1"),
+            ("bucket", "S3 存储桶", "预先创建的私有存储桶名称"),
+            ("role_arn", "MediaConvert 角色", "arn:aws:iam::…:role/…"),
+            ("profile", "本机 AWS 配置名", "留空使用系统凭证；无需在这里填写密钥"),
+            ("prefix", "临时目录前缀", "dolby-workstation"),
+        )):
+            field = QLineEdit()
+            field.setPlaceholderText(placeholder)
+            if key == "prefix":
+                field.setText("dolby-workstation")
+            self.aws_inputs[key] = field
+            aws_layout.addWidget(QLabel(title), row, 0)
+            aws_layout.addWidget(field, row, 1)
+        aws_note = QLabel("云端编码会把音频 PCM 母版上传到您指定的 S3，并产生 AWS 编码、存储及传输费用。使用本机已配置的 AWS 凭证，不在此保存密钥。每次打开应用后需重新启用。")
+        aws_note.setWordWrap(True)
+        aws_note.setObjectName("muted")
+        aws_layout.addWidget(aws_note, 5, 0, 1, 2)
+        self.aws_allow = QCheckBox("本次使用允许上传音频母版并由 AWS 计费")
+        aws_layout.addWidget(self.aws_allow, 6, 0, 1, 2)
+        atmos_layout.addWidget(self.aws_fields)
+        self.atmos_status = QLabel()
+        self.atmos_status.setWordWrap(True)
+        self.atmos_status.setObjectName("muted")
+        atmos_layout.addWidget(self.atmos_status)
+        adjustment_layout.addWidget(self.atmos_group)
         tool_row = QHBoxLayout()
         tool_row.addWidget(self.tool_label)
         tool_row.addStretch()
@@ -579,7 +636,7 @@ class MainWindow(QMainWindow):
         self.output_summary.setWordWrap(True)
         self.output_summary.hide()
         q.addWidget(self.output_summary)
-        self.quality_details = QLabel("导入后自动检查素材。平台识别结果仍需上传草稿并等待转码确认。")
+        self.quality_details = QLabel("导入后自动检查素材。平台双标需完成投稿转码，并在支持设备上回放确认。")
         self.quality_details.setObjectName("muted")
         self.quality_details.setWordWrap(True)
         q.addWidget(self.quality_details)
@@ -666,6 +723,12 @@ class MainWindow(QMainWindow):
         self.rpu_mode.currentIndexChanged.connect(self.update_control_states)
         self.rpu.changed.connect(self.rpu_selected)
         self.audio_mode.currentIndexChanged.connect(self.audio_mode_selected)
+        self.atmos_backend.currentIndexChanged.connect(self.atmos_settings_changed)
+        self.dee_path.changed.connect(self.atmos_settings_changed)
+        self.dee_profile.changed.connect(self.atmos_settings_changed)
+        self.aws_allow.toggled.connect(self.atmos_settings_changed)
+        for field in self.aws_inputs.values():
+            field.textChanged.connect(self.atmos_settings_changed)
         self.ai.toggled.connect(self.update_control_states)
         self.interp.toggled.connect(self.update_control_states)
         self.clean.toggled.connect(self.update_estimates)
@@ -673,16 +736,18 @@ class MainWindow(QMainWindow):
         self.shortcut_open = QShortcut(QKeySequence.Open, self)
         self.shortcut_open.activated.connect(self.choose_media)
         self.apply_preset()
-        self.load_preferences()
-        # Import defaults are determined from each source, not a prior project.
-        self._choosing_automatic = True
-        self.select_data(self.export_preset, "bili_make")
-        self._choosing_automatic = False
-        self.apply_preset()
+        if not self.load_preferences():
+            # A new installation starts with the dual target. An explicitly
+            # saved v2 target is respected; legacy Dolby defaults migrate below.
+            self._choosing_automatic = True
+            self.select_data(self.export_preset, "bili_dual")
+            self._choosing_automatic = False
+            self.apply_preset()
+            self._preset_explicit = False
+            self._audio_mode_explicit = False
         self.advanced_toggle.setChecked(False)
-        self._preset_explicit = False
-        self._audio_mode_explicit = False
         self.set_compatible_audio()
+        self.atmos_settings_changed()
         self.refresh_resume()
         self.check_environment(silent=True)
 
@@ -752,7 +817,83 @@ class MainWindow(QMainWindow):
 
     def current_route(self):
         key = self.export_preset.currentData()
+        if key == "bili_dual" and self.vinfo:
+            from quality import assess_bilibili
+            width, height = self.vinfo.get("display_width", self.vinfo["width"]), self.vinfo.get("display_height", self.vinfo["height"])
+            untouched = (tuple(self.resolution.currentData()) == (0, 0) and not self.fps.currentData()
+                         and self.source_transfer.currentData() == "auto" and self.rpu_mode.currentData() == "auto"
+                         and self.color.currentData() == "dv84")
+            if untouched and max(width, height) <= 3840 and min(width, height) <= 2160 and self.vinfo["fps"] <= 60:
+                if assess_bilibili(self.vinfo).get("status") != "fail":
+                    return "preserve"
         return "preserve" if key in ("preserve", "bili_preserve") else "enhance" if key == "enhance" else "transcode"
+
+    def atmos_config(self):
+        return {"atmos_backend": self.atmos_backend.currentData(), "dee_path": self.dee_path.filepath,
+                "dee_profile": self.dee_profile.filepath,
+                "cloud_atmos": {key: field.text().strip() for key, field in self.aws_inputs.items()}
+                               | {"allow_upload": self.aws_allow.isChecked()}}
+
+    def restore_atmos_config(self, cfg, allow_upload=False):
+        self.select_data(self.atmos_backend, cfg.get("atmos_backend", "dee"))
+        self.dee_path.set_file(cfg.get("dee_path", ""))
+        self.dee_profile.set_file(cfg.get("dee_profile", ""))
+        cloud = cfg.get("cloud_atmos") or {}
+        for key, field in self.aws_inputs.items():
+            field.setText(str(cloud.get(key, "dolby-workstation" if key == "prefix" else "")))
+        self.aws_allow.setChecked(bool(allow_upload))
+        self.atmos_settings_changed()
+
+    def atmos_backend_status(self):
+        cfg = self.atmos_config()
+        key = json.dumps(cfg, sort_keys=True)
+        if self._atmos_status_cache is None or self._atmos_status_cache[0] != key:
+            try:
+                from atmos_encoding import backend_status
+                status = backend_status(cfg)
+            except (ImportError, ValueError, OSError, RuntimeError) as exc:
+                status = {"available": False, "message": "Atmos 编码尚未就绪：" + str(exc)}
+            self._atmos_status_cache = key, status
+        return self._atmos_status_cache[1]
+
+    def atmos_settings_changed(self, *_):
+        self._atmos_status_cache = None
+        cloud = self.atmos_backend.currentData() == "aws"
+        self.dee_fields.setVisible(not cloud)
+        self.aws_fields.setVisible(cloud)
+        self.atmos_status.setText(self.atmos_backend_status().get("message", "尚未配置 Atmos 编码器"))
+        self.refresh_start_state()
+
+    def show_atmos_settings(self):
+        self.advanced_toggle.setChecked(True)
+        self.atmos_settings_changed()
+        QTimer.singleShot(0, lambda: self.content_scroll.ensureWidgetVisible(self.atmos_group))
+
+    def atmos_readiness(self, cfg):
+        """Describe the next audio action without changing widgets or contacting services."""
+        def needs(action, title, detail, button):
+            return {"action": action, "title": title, "detail": detail, "button": button}
+        if not cfg.get("require_atmos") and cfg.get("audio_mode") != "atmos_auto":
+            return None
+        info = self.ainfo if self.audio.filepath else self.vinfo
+        if self.audio.filepath and not info:
+            return needs("add_audio", "请检查替换音轨", "替换音频尚未检查。请用“添加文件”或拖入音频，等待识别后再开始。", "添加音轨…")
+        if not info or info.get("audio_codec", "none") == "none":
+            return needs("add_audio", "请添加音轨", "双杜比需要音轨。请拖入音频，或选择自带声音的视频。", "添加音轨…")
+        if cfg.get("audio_mode") not in ("atmos_auto", "copy"):
+            return needs("audio_settings", "请调整 Atmos 音频设置", "双杜比需要真正的 Atmos。请把音频编码改为“自动 Atmos”，或改选仅杜比视界方案。", "调整音频…")
+        if info.get("audio_codec") == "eac3" and info.get("atmos") == "confirmed":
+            return None
+        if cfg.get("audio_mode") == "copy":
+            return needs("audio_settings", "请调整 Atmos 音频设置", "当前音轨没有可直接保留的 E-AC-3 Atmos；请选择“自动 Atmos”生成音轨。", "调整音频…")
+        status = self.atmos_backend_status()
+        if status.get("available"):
+            return None
+        return needs("configure", "请先配置 Atmos 编码器", status.get("message", "请先完成 Atmos 编码设置。"), "配置 Atmos…")
+
+    def atmos_preflight_error(self, cfg):
+        state = self.atmos_readiness(cfg)
+        return state["detail"] if state else ""
 
     def choose_media(self):
         if self.worker is not None or self.intake_busy:
@@ -867,7 +1008,8 @@ class MainWindow(QMainWindow):
             if video:
                 different = not old_video or Path(old_video).resolve() != Path(video["path"]).resolve()
                 if different:
-                    self._preset_explicit = False
+                    # Keep an explicit or saved export target across imports;
+                    # source-specific metadata and timing choices reset below.
                     self._preserve_restored_settings = False
                     self._audio_mode_explicit = False
                     self.rpu.set_file("")
@@ -903,7 +1045,12 @@ class MainWindow(QMainWindow):
             message = "这个视频的尺寸太小，兼容转码需至少 64 × 48。请在“调整设置”中选择输出尺寸，当前不会开始编码。"
         elif self.source_transfer_needs_attention():
             message = "源文件带有 BT.2020 色彩信息，但缺少动态范围标记。请在“调整设置 → 源动态范围”中明确选择 SDR、HLG 或 PQ，避免错误处理亮度。"
+        elif self.vinfo:
+            state = self.atmos_readiness(self.config())
+            if state:
+                message = state["title"] + "。" + state["detail"]
         self.notify(message)
+        self._readiness_notice = message
         self.refresh_start_state()
         self.refresh_resume()
         self.intake_finished.emit(True, message)
@@ -914,7 +1061,7 @@ class MainWindow(QMainWindow):
             return
         info = self.ainfo if self.audio.filepath and self.ainfo else self.vinfo or {}
         codec = info.get("audio_codec", "none")
-        mode = "copy" if codec in ("none", "aac", "ac3", "eac3", "mp3", "alac") else "aac"
+        mode = "atmos_auto" if self.export_preset.currentData() == "bili_dual" else "copy" if codec in ("none", "aac", "ac3", "eac3", "mp3", "alac") else "aac"
         self._setting_audio_mode = True
         try:
             self.select_data(self.audio_mode, mode)
@@ -948,19 +1095,22 @@ class MainWindow(QMainWindow):
         elif self.vinfo:
             codec = self.vinfo.get("audio_codec", "none")
             if codec == "none":
-                self.audio_hint.setText("视频无音轨；可拖入音频，也可以导出静音视频。")
+                self.audio_hint.setText("视频无音轨；双杜比需要声音，请拖入音频。" if self.export_preset.currentData() == "bili_dual" else "视频无音轨；可拖入音频，也可以导出静音视频。")
             else:
                 suffix = self.audio_processing_hint(codec, self.vinfo.get("atmos"))
                 self.audio_hint.setText(f"使用视频原音 · {codec.upper()}{suffix}")
         else:
             self.audio_hint.setText("未替换音频时，直接使用视频原音。")
-        self.update_automatic_summary()
+        self.refresh_start_state()
 
     def update_automatic_summary(self):
         if not hasattr(self, "automatic_summary"):
             return
         if not self.vinfo:
-            self.automatic_summary.setText("音频已添加，继续添加视频即可。" if self.audio.filepath else "添加视频后自动检查格式。\n通常无需调整设置，直接开始处理。")
+            text = "音频已添加，继续添加视频即可。" if self.audio.filepath else "添加视频后自动检查格式。"
+            if self.export_preset.currentData() == "bili_dual":
+                text = "目标：杜比视界 + Atmos\n" + text + "\n首次生成 Atmos 请完成编码设置。"
+            self.automatic_summary.setText(text)
             return
         route = self.current_route()
         making_dolby = route != "preserve" and self.color.currentData() in ("dv81", "dv84")
@@ -1001,21 +1151,29 @@ class MainWindow(QMainWindow):
         elif self.audio.filepath:
             sound = "使用替换音频"
         elif self.vinfo.get("audio_codec", "none") == "none":
-            sound = "原片无音轨，可直接处理或另加音频"
+            sound = "原片无音轨，请拖入音频后制作双杜比" if self.export_preset.currentData() == "bili_dual" else "原片无音轨，可直接处理或另加音频"
         else:
             sound = "使用原音"
         audio_info = self.ainfo if self.audio.filepath else self.vinfo
-        if making_dolby or self.export_preset.currentData() == "bili_preserve":
-            if mode == "copy" and (audio_info or {}).get("atmos") == "confirmed" and (audio_info or {}).get("audio_codec") == "eac3":
+        if making_dolby or self.export_preset.currentData() in ("bili_preserve", "bili_dual") or mode == "atmos_auto":
+            if mode in ("copy", "atmos_auto") and (audio_info or {}).get("atmos") == "confirmed" and (audio_info or {}).get("audio_codec") == "eac3":
                 sound += " · 保留已有 Atmos"
+            elif mode == "atmos_auto" and (audio_info or {}).get("audio_codec", "none") != "none":
+                status = self.atmos_backend_status()
+                sound += " · 制作 Atmos 空间音轨\n" + ("编码配置就绪，运行时检查许可证与实际输出" if status.get("available") else status.get("message", "请先完成 Atmos 编码设置"))
             elif mode != "none" and (audio_info or {}).get("audio_codec", "none") != "none":
                 sound += " · 转为普通音轨（不保留 Atmos）" if (audio_info or {}).get("atmos") == "confirmed" else " · 普通音轨（未确认 Atmos）"
         prefix = "保存到" if self._output_user_modified else "自动保存到"
         destination = self.output.text().strip()
-        self.automatic_summary.setText(f"{picture}\n\n{sound}\n\n{prefix}：\n{Path(destination).name if destination else '视频所在文件夹'}")
+        target = "目标：杜比视界 + Atmos\n" if self.export_preset.currentData() == "bili_dual" else ""
+        self.automatic_summary.setText(f"{target}{picture}\n\n{sound}\n\n{prefix}：\n{Path(destination).name if destination else '视频所在文件夹'}")
 
     def audio_processing_hint(self, codec, atmos):
         mode = self.audio_mode.currentData()
+        if mode == "atmos_auto":
+            if atmos == "confirmed" and codec == "eac3":
+                return " · Atmos 已确认，将保留原码流"
+            return " · 将制作新的 Atmos 空间音轨" + ("（TrueHD 原有对象信息不会直接保留）" if codec == "truehd" else "")
         if mode == "none":
             return " · 当前设置不导出音轨（不保留 Atmos）" if atmos == "confirmed" else " · 当前设置不导出音轨"
         if mode == "copy" and codec in ("aac", "ac3", "eac3", "mp3", "alac"):
@@ -1055,6 +1213,7 @@ class MainWindow(QMainWindow):
             self._preset_explicit = True
             self._preserve_restored_settings = False
             self._smart_native_conversion = False
+            self._audio_mode_explicit = False
         self.apply_preset()
 
     def open_source(self):
@@ -1064,15 +1223,10 @@ class MainWindow(QMainWindow):
     def choose_source_preset(self):
         if self._preset_explicit or not self.vinfo:
             return
-        info = self.vinfo
-        suitable = info.get("dv_profile") == 8 and info.get("dv_compatibility") == 4 and info.get("color_transfer") == "arib-std-b67"
-        if suitable:
-            from quality import assess_bilibili
-            suitable = assess_bilibili(info).get("status") != "fail"
-        width, height = info.get("display_width", info["width"]), info.get("display_height", info["height"])
-        suitable = suitable and max(width, height) <= 3840 and min(width, height) <= 2160 and info["fps"] <= 60
+        # The target remains double Dolby. current_route independently keeps a
+        # compliant existing picture, so that shortcut never weakens the audio goal.
         self._smart_native_conversion = False
-        key = "bili_preserve" if suitable else "bili_make"
+        key = "bili_dual"
         self._choosing_automatic = True
         self.select_data(self.export_preset, key)
         self._choosing_automatic = False
@@ -1090,16 +1244,34 @@ class MainWindow(QMainWindow):
         ready = self.vinfo is not None and self.worker is None and not self.intake_busy
         unsupported_auto = self.current_route() != "preserve" and self.color.currentData() == "dv81" and self.rpu_mode.currentData() == "auto"
         ambiguous_source = self.source_transfer_needs_attention()
-        self.start.setEnabled(ready and not self.output_size_needs_attention() and not unsupported_auto and not ambiguous_source)
-        self.start.setToolTip("请在“调整设置 → 源动态范围”中明确选择 SDR、HLG 或 PQ。" if ambiguous_source else "杜比视界 8.1 需要配套 RPU 文件；自动分析仅支持 8.4。" if unsupported_auto else "")
-        if ready and ambiguous_source:
-            self.top_status.setText("需要明确源动态范围")
-            self.stage_label.setText("请在“调整设置 → 源动态范围”中明确选择 SDR、HLG 或 PQ。")
-        elif ready and self.top_status.text() == "需要明确源动态范围":
-            size_attention = self.output_size_needs_attention()
-            self.top_status.setText("需要调整尺寸" if size_attention else "可以处理")
-            self.stage_label.setText("请在“调整设置”中选择更大输出尺寸。" if size_attention else "准备就绪，点击“开始处理”。")
-            self.notify("源动态范围已明确，可开始处理。" if self.source_transfer.currentData() != "auto" else "当前方案可直接处理。")
+        size_attention = self.output_size_needs_attention()
+        visual_blocked = size_attention or unsupported_auto or ambiguous_source
+        audio = self.atmos_readiness(self.config()) if ready and not visual_blocked else None
+        self.start.setEnabled(ready and not visual_blocked)
+        self.start.setText(audio["button"] if audio else "开始处理")
+        title, detail, hint = "可以处理", "准备就绪，点击“开始处理”。", "可直接开始处理，也可以继续拖入音频替换原音。"
+        if ambiguous_source:
+            title, detail = "需要明确源动态范围", "请在“调整设置 → 源动态范围”中明确选择 SDR、HLG 或 PQ。"
+            hint = detail
+        elif size_attention:
+            title, detail = "需要调整尺寸", "请在“调整设置”中选择更大输出尺寸。"
+            hint = detail
+        elif unsupported_auto:
+            title, detail = "请提供配套杜比元数据", "杜比视界 8.1 需要配套 RPU 文件；自动分析仅支持 8.4。"
+            hint = detail
+        elif audio:
+            title = audio["title"]
+            detail = title + "。" + ("点击“配置 Atmos…”完成设置后再处理。" if audio["action"] == "configure" else audio["detail"])
+            hint = title + "，完成后再处理。"
+        self.start.setToolTip(audio["detail"] if audio else detail if visual_blocked else "")
+        result_visible = self.last_output is not None or (self._preserve_restored_settings and self.outcome is not None)
+        if ready and not result_visible:
+            self.top_status.setText(title)
+            self.stage_label.setText(detail)
+            self.drop_hint.setText(hint)
+            if self.notification.text() == self._readiness_notice:
+                self.notify(detail)
+                self._readiness_notice = detail
         self.update_automatic_summary()
 
     def source_transfer_needs_attention(self):
@@ -1153,8 +1325,9 @@ class MainWindow(QMainWindow):
             "source_transfer_override": self.source_transfer.currentData() if route != "preserve" else "auto",
             "audio_mode": self.audio_mode.currentData(), "auto_clean": self.clean.isChecked(),
             "preset": self.encoding_preset.currentData(), "crf": self.crf.value(),
-            "batch_size": self.batch_size.value(), "require_atmos": False,
+            "batch_size": self.batch_size.value(), "require_atmos": self.export_preset.currentData() == "bili_dual" or self.audio_mode.currentData() == "atmos_auto",
         }
+        cfg.update(self.atmos_config())
         if route == "transcode" and rate:
             cfg["fps_override"] = rate
         if route == "enhance":
@@ -1170,7 +1343,7 @@ class MainWindow(QMainWindow):
         self.interp.setChecked(key == "enhance" and self.interp_available)
         self.select_data(self.resolution, (0, 0))
         self.select_data(self.fps, 120 if key == "enhance" else 0)
-        if key == "bili_make":
+        if key in ("bili_make", "bili_dual"):
             self.select_data(self.color, "dv84")
             if self.vinfo:
                 width = self.vinfo.get("display_width", self.vinfo["width"])
@@ -1344,7 +1517,6 @@ class MainWindow(QMainWindow):
         atmos = {"confirmed": "Atmos 已确认", "unknown": "Atmos 待确认", "absent": "无 Atmos 标记"}.get(info.get("atmos"), "Atmos 待确认")
         self.source_audio[1].setText(f"{audio}\n{atmos}")
         self.drop_title.setText(info.get("filename") or Path(path).name)
-        self.drop_hint.setText("可直接开始处理，也可以继续拖入音频替换原音。")
         # Rechecking the current source refreshes its media information without
         # replacing picture options the user has already adjusted.
         if first_probe and not self.restore_in_progress and self.worker is None and not self._preserve_restored_settings:
@@ -1356,11 +1528,6 @@ class MainWindow(QMainWindow):
         self.play_source.show()
         self.refresh_start_state()
         result_visible = self.last_output is not None or (self._preserve_restored_settings and self.outcome is not None)
-        if self.worker is None and not result_visible:
-            attention = self.output_size_needs_attention()
-            ambiguous_source = self.source_transfer_needs_attention()
-            self.top_status.setText("需要明确源动态范围" if ambiguous_source else "需要调整尺寸" if attention else "可以处理")
-            self.stage_label.setText("请在“调整设置 → 源动态范围”中明确选择 SDR、HLG 或 PQ。" if ambiguous_source else "请在“调整设置”中选择更大输出尺寸。" if attention else "准备就绪，点击“开始处理”。")
         if not result_visible:
             self.render_source_quality()
         self.update_estimates()
@@ -1372,10 +1539,11 @@ class MainWindow(QMainWindow):
             from quality import assess_bilibili
             report = assess_bilibili(self.vinfo)
             self.last_report = report
-            if self.export_preset.currentData() == "bili_make":
-                self.quality_status.setText("素材已读取 · 将自动制作杜比视界")
+            if self.export_preset.currentData() in ("bili_make", "bili_dual"):
+                dual = self.export_preset.currentData() == "bili_dual"
+                self.quality_status.setText("素材已读取 · 目标为杜比视界 + Atmos" if dual else "素材已读取 · 将自动制作杜比视界")
                 self.quality_status.setStyleSheet("color:#374151;font-weight:600")
-                self.quality_details.setText("素材无需自带杜比元数据。自动模式将分析最终画面，生成 Profile 8.4 元数据；成片仍会接受本地格式与解码检查，平台识别需草稿转码验收。")
+                self.quality_details.setText("素材无需自带杜比元数据。自动模式将分析最终画面，生成 Profile 8.4 元数据；成片仍会接受本地格式与解码检查。" + ("双杜比同时要求真正的 E-AC-3 Atmos，不能用普通 AAC 或多声道替代。" if dual else "") + "平台识别需投稿转码及回放验收。")
                 self.view_report.setEnabled(True)
             elif self.export_preset.currentData().startswith("bili_"):
                 self.render_quality(report, "素材检查")
@@ -1403,7 +1571,7 @@ class MainWindow(QMainWindow):
             readiness = {"pass": "符合公开指引的本地技术条件", "warning": "存在待确认事项", "fail": "尚不符合杜比 8.4 条件"}.get(bili.get("status"), "待检查")
             details.append(f"独立 B站杜比检查：{readiness}；不影响本次常规成片的技术质检结果。")
         self.quality_details.setText("\n".join(details) or report.get("summary", "检查完成"))
-        self.platform_status.setText("平台草稿已验收" if report.get("platform_verified") else "平台尚未验收")
+        self.platform_status.setText("平台回放已验收" if report.get("platform_verified") else "平台尚未验收")
         self.platform_status.setToolTip("本地格式检测与平台实际识别是两个独立步骤。")
         media = report.get("media")
         if isinstance(media, dict):
@@ -1475,7 +1643,10 @@ class MainWindow(QMainWindow):
         self._smart_native_conversion = False
         try:
             route = cfg.get("route", "enhance")
-            preset = ("bili_preserve" if cfg.get("delivery") == "bilibili" else "preserve") if route == "preserve" else "bili_make" if cfg.get("delivery") == "bilibili" else "enhance" if route == "enhance" else "quality"
+            current_cloud = self.atmos_config()["cloud_atmos"]
+            consent = current_cloud.get("allow_upload", False) and all(current_cloud.get(key, "") == (cfg.get("cloud_atmos") or {}).get(key, "") for key in self.aws_inputs)
+            self.restore_atmos_config(cfg, allow_upload=consent)
+            preset = "bili_dual" if cfg.get("delivery") == "bilibili" and cfg.get("require_atmos") else ("bili_preserve" if cfg.get("delivery") == "bilibili" else "preserve") if route == "preserve" else "bili_make" if cfg.get("delivery") == "bilibili" else "enhance" if route == "enhance" else "quality"
             self.select_data(self.export_preset, preset)
             self.preset_note.setText(self.PRESETS[preset][1])
             self.video.set_file(cfg["video"])
@@ -1517,6 +1688,16 @@ class MainWindow(QMainWindow):
                 raise ValueError("没有可恢复的任务。")
             cfg = dict(checkpoint["cfg"])
             self.restore_config(cfg)
+            if cfg.get("atmos_backend") == "aws" and cfg.get("audio_mode") == "atmos_auto":
+                cfg["cloud_atmos"] = dict(cfg.get("cloud_atmos") or {}, allow_upload=self.aws_allow.isChecked())
+                copied_audio = checkpoint.get("atmos_audio") or {}
+                copy_only = copied_audio.get("generated") is False and copied_audio.get("method") == "source_stream_copy"
+                # This hint may skip a redundant UI prompt, never authorize a
+                # cloud operation. The engine still rechecks source and cache.
+                if not cfg["cloud_atmos"]["allow_upload"] and not copy_only:
+                    self.notify("已恢复任务设置。继续云端任务前，请在 Atmos 编码设置中启用本次上传与计费。", True)
+                    self.show_atmos_settings()
+                    return
             cfg["resume"] = True
             self.begin(cfg)
         except Exception as exc:
@@ -1541,6 +1722,20 @@ class MainWindow(QMainWindow):
         if self.source_transfer_needs_attention():
             self.notify("源文件动态范围标记缺失，请在“调整设置 → 源动态范围”中明确选择 SDR、HLG 或 PQ 后再开始。", True)
             self.advanced_toggle.setChecked(True)
+            return
+        self._atmos_status_cache = None
+        audio_action = self.atmos_readiness(cfg)
+        if audio_action:
+            self.refresh_start_state()
+            self.notify(audio_action["detail"], True)
+            self._readiness_notice = audio_action["detail"]
+            if audio_action["action"] == "configure":
+                self.show_atmos_settings()
+            elif audio_action["action"] == "add_audio":
+                self.audio.browse()
+            else:
+                self.advanced_toggle.setChecked(True)
+                QTimer.singleShot(0, lambda: self.content_scroll.ensureWidgetVisible(self.audio_mode))
             return
         if not cfg["output"]:
             self.choose_output()
@@ -1567,7 +1762,11 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "需要安装杜比制作工具", message)
                 return
         if cfg["route"] == "preserve" and cfg["delivery"] == "bilibili" and self.last_report and self.last_report.get("status") == "fail":
-            QMessageBox.warning(self, "原片还不符合目标格式", "当前原片未满足 B站杜比 8.4 的本地技术检查。请选择“B站杜比 · 自动制作”，或手选其他导出方式。\n\n" + self.last_report.get("summary", ""))
+            QMessageBox.warning(self, "原片还不符合目标格式", "当前原片未满足 B站杜比 8.4 的本地技术检查。请选择自动制作方案，或手选其他导出方式。\n\n" + self.last_report.get("summary", ""))
+            return
+        if self.export_preset.currentData() == "bili_dual" and cfg["color_mode"] != "dv84":
+            self.notify("B站双杜比画面需要杜比视界 8.4，请在画面格式中选择“杜比视界 8.4 · HLG”。", True)
+            self.advanced_toggle.setChecked(True)
             return
         self.save_preferences()
         cfg["resume"] = False
@@ -1588,6 +1787,7 @@ class MainWindow(QMainWindow):
         self.resume.setEnabled(False)
         self.check_tools.setEnabled(False)
         self.import_button.setEnabled(False)
+        self.atmos_setup.setEnabled(False)
         self.advanced.setEnabled(False)
         self.audio_clear.setEnabled(False)
         self.open_output.setEnabled(False)
@@ -1628,6 +1828,7 @@ class MainWindow(QMainWindow):
         self.param_group.setEnabled(True)
         self.check_tools.setEnabled(True)
         self.import_button.setEnabled(True)
+        self.atmos_setup.setEnabled(True)
         self.advanced.setEnabled(True)
         self.update_control_states()
         self.refresh_start_state()
@@ -1730,14 +1931,17 @@ class MainWindow(QMainWindow):
             bili = self.last_report.get("bilibili_readiness")
             if isinstance(bili, dict):
                 details += "\n\n独立 B站杜比准备检查\n" + bili.get("summary", "")
-            QMessageBox.information(self, "本地技术检查", self.last_report.get("summary", "") + "\n\n" + details + "\n\n平台识别结果需要草稿转码验收。")
+            QMessageBox.information(self, "本地技术检查", self.last_report.get("summary", "") + "\n\n" + details + "\n\n平台双标仍需完成投稿转码，并在支持设备上回放验收。")
 
     def save_preferences(self):
         cfg = self.config()
         keys = ("color_mode", "audio_mode", "model", "preset", "crf", "batch_size", "auto_clean", "hdr_remaster")
         data = {key: cfg[key] for key in keys}
-        data.update({"version": 1, "export_preset": self.export_preset.currentData(),
+        data.update({"version": 2, "export_preset": self.export_preset.currentData(),
                      "resolution": self.resolution.currentData(), "fps": self.fps.currentData()})
+        data.update(self.atmos_config())
+        # Upload/cost consent is deliberately a per-application-session choice.
+        data["cloud_atmos"]["allow_upload"] = False
         try:
             self.settings_file.parent.mkdir(parents=True, exist_ok=True)
             temporary = self.settings_file.with_suffix(".tmp")
@@ -1749,9 +1953,18 @@ class MainWindow(QMainWindow):
     def load_preferences(self):
         try:
             data = json.loads(self.settings_file.read_text(encoding="utf-8"))
-            if data.get("version") != 1:
-                return
-            self.select_data(self.export_preset, data.get("export_preset", "bili_preserve"))
+            if not isinstance(data, dict) or data.get("version") not in (1, 2):
+                return False
+            preset = data.get("export_preset", "bili_dual")
+            if preset not in self.PRESETS:
+                return False
+            migrate = data["version"] == 1 and preset in ("bili_make", "bili_preserve")
+            if migrate:
+                # Preferences are not job manifests. Upgrade only the old
+                # Dolby default; restore_config still restores old jobs intact.
+                data = dict(data, export_preset="bili_dual", audio_mode="atmos_auto", color_mode="dv84")
+            self.restore_atmos_config(data, allow_upload=False)
+            self.select_data(self.export_preset, data.get("export_preset", "bili_dual"))
             for combo, key in [(self.resolution, "resolution"), (self.fps, "fps"), (self.color, "color_mode"),
                                (self.audio_mode, "audio_mode"), (self.model, "model"), (self.encoding_preset, "preset"),
                                (self.hdr_remaster, "hdr_remaster")]:
@@ -1760,9 +1973,12 @@ class MainWindow(QMainWindow):
             self.crf.setValue(data.get("crf", 18))
             self.batch_size.setValue(data.get("batch_size", 32))
             self.clean.setChecked(data.get("auto_clean", True))
+            self._preset_explicit = not migrate
+            self._audio_mode_explicit = not migrate and "audio_mode" in data
             self.update_control_states()
+            return True
         except (OSError, ValueError, TypeError):
-            pass
+            return False
 
     def closeEvent(self, event):
         self.probe_timer.stop()

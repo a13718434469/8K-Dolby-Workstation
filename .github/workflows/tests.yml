@@ -43,7 +43,7 @@ jobs:
           ffmpeg -hide_banner -version
           ffprobe -hide_banner -version
       - name: Check Python syntax
-        run: python -m compileall -q main.py app_identity.py pipeline.py quality.py dolby_analysis.py hdr_remaster.py cli.py tests
+        run: python -m compileall -q main.py app_identity.py pipeline.py quality.py dolby_analysis.py hdr_remaster.py atmos_encoding.py atmos_cloud.py cli.py tests
       - name: Run regression suite
         run: python -m unittest discover -s tests -v
 

@@ -14,6 +14,7 @@ def main(argv=None):
     parser.add_argument("--route", choices=("preserve", "transcode", "enhance"), default="preserve", help="默认原片保留")
     parser.add_argument("--delivery", choices=("general", "bilibili"), default="general")
     parser.add_argument("--auto-dolby", action="store_true", help="自动制作 B站杜比视界 8.4；合规原片直接保留，其他素材自动分析生成元数据（4K60以内）")
+    parser.add_argument("--auto-double-dolby", action="store_true", help="自动制作杜比视界 8.4 + 真正 Atmos；普通音轨需要已配置的 Atmos 编码器，不允许降级为普通音频")
     ai = parser.add_mutually_exclusive_group()
     ai.add_argument("--ai", action="store_true", help="增强路线主动启用 Real-ESRGAN")
     ai.add_argument("--no-ai", action="store_true", help="禁用 Real-ESRGAN（默认）")
@@ -30,8 +31,17 @@ def main(argv=None):
     parser.add_argument("--hdr-peak-nits", type=int, choices=range(100, 1001), metavar="100..1000", help="SDR 自动 HDR 制作的峰值亮度，默认 600 nits")
     parser.add_argument("--source-transfer", choices=("auto", "bt709", "arib-std-b67", "smpte2084"), help="源动态范围解释：自动、SDR BT.709、HLG 或 PQ；缺少 BT.2020 动态范围标记时需明确选择")
     parser.add_argument("--audio", default="", help="可选外部音频")
-    parser.add_argument("--audio-mode", choices=("copy", "aac", "eac3", "none"), default="copy")
-    parser.add_argument("--require-atmos", action="store_true", help="仅在最终文件确认保留 Atmos 时成功")
+    parser.add_argument("--audio-mode", choices=("atmos_auto", "copy", "aac", "eac3", "none"), default="copy")
+    parser.add_argument("--require-atmos", action="store_true", help="仅在最终文件确认包含真正 Atmos 时成功")
+    parser.add_argument("--atmos-backend", choices=("dee", "aws"), default="dee", help="Atmos 编码后端；默认本地已授权 DEE")
+    parser.add_argument("--dee-path", default="", help="完整 DEE 编码程序路径")
+    parser.add_argument("--dee-profile", default="", help="与本机已授权 DEE 版本匹配的 JSON 命令配置文件")
+    parser.add_argument("--aws-region", default="", help="AWS MediaConvert 区域")
+    parser.add_argument("--aws-bucket", default="", help="音频母版及编码输出使用的私有 S3 存储桶")
+    parser.add_argument("--aws-role-arn", default="", help="MediaConvert 服务角色 ARN")
+    parser.add_argument("--aws-profile", default="", help="本机 AWS 凭证配置名；不接受明文密钥")
+    parser.add_argument("--aws-prefix", default="dolby-workstation", help="本任务临时对象目录前缀")
+    parser.add_argument("--allow-cloud-upload", action="store_true", help="本次明确允许上传音频母版并产生 AWS 费用；恢复云端任务也需明确传入")
     parser.add_argument("--model", default="realesrgan-x4plus")
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--preset", choices=("ultrafast", "superfast", "veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow"), default="medium")
@@ -40,6 +50,7 @@ def main(argv=None):
     parser.add_argument("--workspace", default=str(WORKSPACE))
     parser.add_argument("--resume", action="store_true", help="使用工作目录中原任务的完整参数恢复")
     args = parser.parse_args(argv)
+    auto_picture = args.auto_dolby or args.auto_double_dolby
     supplied = list(argv if argv is not None else sys.argv[1:])
     explicit = {token.split("=", 1)[0] for token in supplied if token.startswith("-")}
     try:
@@ -49,24 +60,32 @@ def main(argv=None):
             if not cp:
                 parser.error("工作目录中没有可恢复的断点")
             # Restoring always uses the original settings; reject ignored options.
-            allowed = {"--resume", "--workspace"}
+            allowed = {"--resume", "--workspace", "--allow-cloud-upload"}
             if any(token.startswith("-") and token.split("=", 1)[0] not in allowed for token in supplied):
-                parser.error("--resume 仅可与 --workspace 一起使用；恢复原任务参数")
+                parser.error("--resume 仅可与 --workspace / --allow-cloud-upload 一起使用；恢复原任务参数")
             cfg = dict(cp["cfg"], resume=True)
+            if cfg.get("atmos_backend") == "aws" and cfg.get("audio_mode") == "atmos_auto":
+                cfg["cloud_atmos"] = dict(cfg.get("cloud_atmos") or {}, allow_upload=args.allow_cloud_upload)
         else:
             if not args.input:
                 parser.error("新任务需要 --input")
-            if args.auto_dolby and explicit & {"--route", "--delivery", "--color"}:
-                parser.error("--auto-dolby 自动选择路线、B站交付和杜比 8.4；请勿同时指定 --route / --delivery / --color")
+            if args.auto_dolby and args.auto_double_dolby:
+                parser.error("--auto-dolby 与 --auto-double-dolby 请选择一个")
+            if auto_picture and explicit & {"--route", "--delivery", "--color"}:
+                parser.error("自动制作模式选择路线、B站交付和杜比 8.4；请勿同时指定 --route / --delivery / --color")
+            if args.auto_double_dolby and "--audio-mode" in explicit and args.audio_mode != "atmos_auto":
+                parser.error("--auto-double-dolby 必须使用 --audio-mode atmos_auto，不能降级为普通音频")
+            if args.allow_cloud_upload and args.atmos_backend != "aws":
+                parser.error("--allow-cloud-upload 仅用于 --atmos-backend aws")
             if args.rpu and args.rpu_mode == "auto":
                 parser.error("--rpu 与 --rpu-mode auto 冲突；手动 RPU 请用 external 或省略 --rpu-mode")
             if args.rpu_mode == "external" and not args.rpu:
                 parser.error("--rpu-mode external 需要 --rpu 文件")
-            if (args.ai or args.interp) and (args.auto_dolby or args.route != "enhance"):
+            if (args.ai or args.interp) and (auto_picture or args.route != "enhance"):
                 parser.error("--ai / --interp 需要 --route enhance")
-            if not args.auto_dolby and args.route == "preserve" and (args.size or args.fps or args.rpu or args.color != "source"):
+            if not auto_picture and args.route == "preserve" and (args.size or args.fps or args.rpu or args.color != "source"):
                 parser.error("原片保留沿用原视频；改变尺寸、帧率、色彩或 RPU 请使用 --route transcode")
-            if not args.auto_dolby and args.route == "preserve" and args.source_transfer not in (None, "auto"):
+            if not auto_picture and args.route == "preserve" and args.source_transfer not in (None, "auto"):
                 parser.error("原片保留不能改写源动态范围解释；--source-transfer 请配合 --route transcode 或 --auto-dolby")
             if args.interp and not args.fps:
                 parser.error("RIFE 插帧需要明确 --fps")
@@ -87,8 +106,8 @@ def main(argv=None):
             route, delivery = args.route, args.delivery
             fps = args.fps
             color = args.color
-            audio_mode = args.audio_mode
-            if args.auto_dolby:
+            audio_mode = "atmos_auto" if args.auto_double_dolby else args.audio_mode
+            if auto_picture:
                 suitable = assess_bilibili(source).get("status") != "fail"
                 unchanged = not (args.size or fps or args.rpu or args.rpu_mode == "external" or args.source_transfer not in (None, "auto"))
                 within_limits = max(width, height) <= 3840 and min(width, height) <= 2160 and source["fps"] <= 60
@@ -99,7 +118,7 @@ def main(argv=None):
                     width, height = max(2, int(width * scale) // 2 * 2), max(2, int(height * scale) // 2 * 2)
                 if Fraction(str(fps or source["fps_fraction"])) > 60:
                     fps = "60"
-                if "--audio-mode" not in explicit:
+                if "--audio-mode" not in explicit and not args.auto_double_dolby:
                     audio = inspect_audio(args.audio) if args.audio else source
                     if audio.get("audio_codec", "none") not in ("none", "aac", "ac3", "eac3", "mp3", "alac"):
                         audio_mode = "aac"
@@ -112,13 +131,19 @@ def main(argv=None):
             if route != "preserve" and color == "dv81" and not args.rpu:
                 parser.error("杜比视界 8.1 需要 --rpu 外部元数据；自动逐帧分析当前仅支持 8.4")
             cfg = {"video": args.input, "output": args.output, "audio": args.audio,
-                   "route": route, "delivery": delivery, "require_atmos": args.require_atmos,
+                   "route": route, "delivery": delivery, "require_atmos": args.require_atmos or args.auto_double_dolby or audio_mode == "atmos_auto",
                    "ai": args.ai, "interp": args.interp, "target_fps": fps or source["fps_fraction"],
                    "width": width, "height": height, "color_mode": color, "rpu": args.rpu,
                    "work_width": work_width, "work_height": work_height,
                    "audio_mode": audio_mode, "model": args.model, "batch_size": args.batch_size,
                    "preset": args.preset, "crf": args.crf, "auto_clean": not args.keep_temp,
                    "workspace": args.workspace}
+            if audio_mode == "atmos_auto":
+                cfg.update({"atmos_backend": args.atmos_backend, "dee_path": args.dee_path,
+                            "dee_profile": args.dee_profile,
+                            "cloud_atmos": {"region": args.aws_region, "bucket": args.aws_bucket,
+                                            "role_arn": args.aws_role_arn, "profile": args.aws_profile,
+                                            "prefix": args.aws_prefix, "allow_upload": args.allow_cloud_upload}})
             if args.rpu_mode or args.rpu or (route != "preserve" and color in ("dv81", "dv84")):
                 cfg["rpu_mode"] = args.rpu_mode or ("external" if args.rpu else "auto")
             if args.hdr_remaster is not None:
