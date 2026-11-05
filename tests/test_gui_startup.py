@@ -14,13 +14,17 @@ class GuiStartupTests(unittest.TestCase):
         # constructed the one QCoreApplication allowed in the test runner.
         script = r'''
 import sys
+import tempfile
+from pathlib import Path
 import main
-from PyQt5.QtCore import QTimer
+from PyQt5.QtCore import QTimer, QPoint
 
 # Reproduce Qt's broken automatic prefix without relying on a particular
 # username or the CI runner having a non-ASCII installation directory.
 main.QApplication.setLibraryPaths(["/nonexistent/dolby-startup-plugin-path"])
 main.load_checkpoint = lambda: None
+preferences = tempfile.TemporaryDirectory(prefix="dolby-ui-preferences-")
+main.WORKSPACE = Path(preferences.name)
 OriginalWindow = main.MainWindow
 
 class StartupWindow(OriginalWindow):
@@ -34,12 +38,75 @@ class StartupWindow(OriginalWindow):
         assert self.select_data(self.resolution, (1920, 1080)), "resolution lookup failed"
         assert tuple(self.resolution.currentData()) == (1920, 1080), "wrong restored resolution"
         assert not self.grab().isNull(), "window could not render"
+        self.resize(1000, 640)
+        main.QApplication.processEvents()
+        assert self.height() <= 680, "layout forces the window off a small display"
+        assert self.start.mapTo(self, QPoint(0, 0)).y() + self.start.height() <= self.height(), "primary control is clipped"
+        # User-facing presets must never silently send HDR through the SDR AI
+        # pipeline or re-encode a source selected for bitstream preservation.
+        self.vinfo = {
+            "filename": "fixture.mp4", "width": 3840, "height": 2160,
+            "fps": 60.0, "fps_fraction": "60", "duration": 10,
+            "total_frames": 600, "color_transfer": "arib-std-b67",
+            "dv_profile": 8, "dv_compatibility": 4,
+            "audio_codec": "eac3", "atmos": "confirmed",
+        }
+        self.select_data(self.export_preset, "bili_preserve")
+        self.apply_preset()
+        preserved = self.config()
+        assert preserved["route"] == "preserve"
+        assert preserved["width"] == 3840 and preserved["height"] == 2160
+        assert not preserved["ai"] and not preserved["interp"]
+        assert not self.color.isEnabled(), "preserve mode exposes color conversion"
+        self.select_data(self.export_preset, "quality")
+        native = self.config()
+        assert native["route"] == "transcode"
+        assert native["color_mode"] == "hlg" and not native["ai"]
+        self.vinfo.update({"rotation": 90, "display_width": 2160, "display_height": 3840})
+        self.apply_preset()
+        assert (self.config()["width"], self.config()["height"]) == (2160, 3840), "rotated phone video lost its display aspect"
+        self.select_data(self.export_preset, "bili_preserve")
+        assert (self.config()["width"], self.config()["height"]) == (3840, 2160), "preserve mode rewrote encoded dimensions"
+        self.select_data(self.export_preset, "quality")
+        self.render_quality({
+            "status": "pass", "checks": [{"label": "完整解码", "detail": "通过", "status": "pass"}],
+            "bilibili_readiness": {"status": "fail", "summary": "不是 DV8.4"},
+        }, "成片质检")
+        assert "本地技术条件通过" in self.quality_status.text()
+        assert "不影响本次常规成片" in self.quality_details.text()
+        self.select_data(self.export_preset, "bili_make")
+        assert self.config()["color_mode"] == "dv84" and self.rpu.isEnabled()
+        # Resume must pass the original persisted config intact, including
+        # exact fractional timing and options not represented by a UI control.
+        saved_config = {
+            "video": "/not-opened/resume-source.mkv", "output": "/not-opened/resume-output.mp4",
+            "route": "transcode", "delivery": "general", "width": 2160, "height": 3840,
+            "fps_override": "60000/1001", "ai": False, "interp": False,
+            "color_mode": "hlg", "audio_mode": "copy", "crf": 17, "batch_size": 16,
+            "future_validation_option": "must survive resume",
+        }
+        resumed = []
+        original_begin = self.begin
+        original_checkpoint = main.load_checkpoint
+        self.begin = lambda cfg: resumed.append(cfg)
+        main.load_checkpoint = lambda: {"cfg": saved_config}
+        self.resume_previous()
+        self.begin = original_begin
+        main.load_checkpoint = original_checkpoint
+        assert resumed and resumed[0]["resume"] is True
+        assert resumed[0]["future_validation_option"] == "must survive resume"
+        assert resumed[0]["fps_override"] == "60000/1001" and not resumed[0]["ai"]
+        self.save_preferences()
+        saved = self.settings_file.read_text(encoding="utf-8")
+        assert '"video"' not in saved and '"output"' not in saved and '"rpu"' not in saved
         print("GUI_STARTUP_OK", flush=True)
         self.close()
         main.QApplication.instance().quit()
 
 main.MainWindow = StartupWindow
-sys.exit(main.main())
+result = main.main()
+preferences.cleanup()
+sys.exit(result)
 '''
         env = dict(os.environ, QT_QPA_PLATFORM="offscreen", PYTHONUTF8="1")
         try:

@@ -129,6 +129,31 @@ class ProcessThreadTests(unittest.TestCase):
             finally:
                 self.clean_worker(worker)
 
+    def test_replaced_source_probe_cancels_without_emitting_stale_error(self):
+        import quality
+        entered = threading.Event()
+        results = []
+
+        def inspect(path, *, cancel_event):
+            entered.set()
+            if not cancel_event.wait(2):
+                raise AssertionError("cancel was not forwarded to the source inspector")
+            raise quality.QualityCancelled("cancelled source selection")
+
+        worker = main.ProbeThread("source.mp4")
+        worker.result.connect(lambda *args: results.append(args))
+        with patch.object(quality, "inspect_media", side_effect=inspect):
+            try:
+                worker.start()
+                self.assertTrue(entered.wait(2))
+                worker.request_stop()
+                self.assertTrue(worker.wait(3000), "source analysis did not stop promptly")
+                self.app.processEvents()
+                self.assertEqual(results, [], "cancelled analysis overwrote the new source state")
+            finally:
+                worker.request_stop()
+                self.assertTrue(worker.wait(3000))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,156 +1,199 @@
-# 8K Dolby Workstation
+# 8K Dolby Workstation 2.1
 
-面向 **SDR 视频**的桌面与命令行处理工作站：RIFE 插帧、Real-ESRGAN 超分、HEVC 10-bit 编码，以及 SDR / HDR10 / Dolby Vision Profile 8.1 输出封装。
+用于视频检查、原片保留、高精度转码和可选 AI 增强的本地工作站。桌面与命令行共用处理核心，输出经过解码和格式检查后才保存为正式文件。
 
-支持最高 8K 目标尺寸、可选 120fps、分批超分编码和任务恢复。实际速度取决于素材、目标尺寸、GPU、编码预设与磁盘，项目不提供固定 GPU 耗时承诺。
+本版将 **B站 Dolby Vision 8.4 交付**、**常规高质量导出**和 **AI 增强**分开，默认优先保留原片。已有 Dolby Vision / Atmos 素材可检查后保留码流；需要重新制作时，使用明确的色彩与配套元数据流程。
 
 ![Python](https://img.shields.io/badge/Python-3.10+-blue)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Platform](https://img.shields.io/badge/Desktop-Windows-orange)
+![Desktop](https://img.shields.io/badge/Desktop-Windows-orange)
 
-## 功能与输出范围
+## 选择适合素材的方案
 
-| 功能 | 当前行为 |
-| --- | --- |
-| AI 插帧 | 使用 RIFE v4 模型，按目标帧率计算所需帧数；保留分数源帧率，关闭时沿用源帧率 |
-| AI 超分 | Real-ESRGAN x4，按批次超分后编码；可关闭并改用普通缩放 |
-| 画面尺寸 | 桌面界面提供 1080p / 4K / 8K；等比缩放并补边，不拉伸画面 |
-| SDR | BT.709、HEVC 10-bit、MP4 |
-| HDR10 | 将 SDR 工作画面转换为 BT.2020 / PQ、HEVC 10-bit |
-| Dolby Vision 8.1 | 注入用户提供的配套 Profile 8 RPU，并检查最终 Dolby Vision 8.1 配置 |
-| 音频 | 复制第一条音轨、编码 AAC / E-AC-3、替换外部音轨，或输出无音轨视频 |
-| 任务控制 | 日志、阶段进度、暂停、停止、基于完成阶段和视频分片的恢复 |
-| 输出校验 | 检查尺寸、帧数、帧率、像素格式和时长；验证后才发布最终文件 |
+| 界面方案 | 路线 | 适用素材与行为 |
+| --- | --- | --- |
+| B站杜比 · 保留原片 | `preserve` | 已有合规 Dolby Vision 8.4 素材；保留视频编码、尺寸、帧率、位深和杜比数据，封装为 MP4。已有 E-AC-3 JOC / Atmos 可原码流复制 |
+| B站杜比 · HLG / 8.4 制作 | `transcode` | 从 SDR / HDR 素材制作 HLG 基础层，注入针对最终画面及时序制作的 **8.4 RPU**；需要成片质检 |
+| 高质量常规导出 | `transcode` | 以源精度解码，按目标进行高精度色彩处理，最终编码为 10-bit HEVC；默认沿用源尺寸、帧率和 SDR / PQ / HLG 类型 |
+| AI 增强 · 插帧与超分 | `enhance` | 按需使用 RIFE 插帧、Real-ESRGAN x4 超分和分批编码；面向 SDR，使用 8-bit RGB 工作帧 |
 
-**画面与音频说明：**
+原片保留不会为了凑成 8K / 120fps 而重新编码。重新编码不保证与源文件完全一致，AI 超分和插帧也可能引入伪影。建议先检查短片，再处理长片。
 
-- 当前输入流程只支持 SDR；检测到 PQ / HLG 源会拒绝处理。HDR 素材应先在受控流程中转换为 SDR。
-- AI 工作帧是最高 1080p 的 8-bit RGB PNG。高于 1080p 的输入也会先缩小；10-bit 输出不会恢复原素材中已丢失的精度或细节。
-- SDR → HDR10 是色彩空间与传递函数转换，不会恢复素材中不存在的 HDR 高光，也不等同于专业 HDR 调色。
-- Dolby Vision 必须提供针对**最终画面、调色、时序和帧数**制作的 RPU。程序检查 Profile 8、帧数和最终 8.1 配置，但无法判断元数据是否与画面在视觉上匹配；它不自动生成真实杜比动态调色元数据。
-- 普通 E-AC-3 编码不生成 Dolby Atmos 对象元数据。复制已有 E-AC-3 JOC 音轨时保留其原始码流；TrueHD 音轨不能在此流程中直接复制进 MP4，需选择 AAC / E-AC-3 重编码，而重编码不保留 Atmos 元数据。
-- 项目不承诺杜比认证、上传平台认证标签或所有设备的播放兼容性。
+### B站杜比与双标
+
+- B站创作中心公开指引列出 **HLG、BT.2020、10-bit HEVC、Dolby Vision Profile 8.4、MP4 / MOV / M4V**。该页编辑于 **2021-11-22**，列出的尺寸 / 帧率为 3840×2160 / 60fps，建议码率约 30Mbps。应用将这些作为保守交付参考与提示，**不把旧文档当作当前平台的完整限制**；竖屏按相应长短边参考检查。[B站官方指引](https://www.bilibili.com/opus/560508706903943321)
+- Dolby 的 **2024-03-26** 视频分享服务 FAQ 也说明应依据目标服务选择杜比配置，B站对应 Profile 8.4。PQ / Profile 8.1 不能通过改标签等同于 HLG / Profile 8.4。[Dolby 官方 FAQ](https://professionalsupport.dolby.com/s/article/Dolby-Vision-for-video-sharing-services-FAQs?language=en_US)
+- 本地检查核实 Profile 8 / 基础层兼容 ID 4、HLG、BT.2020、4:2:0 10-bit、RPU / 基础层与单层声明，不能证明 RPU 与每个镜头的视觉匹配。
+- “杜比视界 + 全景声双标”需要真实 Atmos 音轨。只有 FFprobe / 可选 MediaInfo 给出明确 JOC / Atmos 编码证据时，程序才确认 Atmos；普通 E-AC-3、多声道或音轨标题里的 “Atmos” 不作为证明。
+- 优先复制已有 **E-AC-3 JOC / Atmos**。AAC / 普通 E-AC-3 重编码不生成 Atmos 对象元数据；TrueHD Atmos 不能在此流程中直接复制到 MP4，需要另行准备受支持的音频母版。
+- **本地格式通过不等于 B站已经认可。** 最终要等待创作中心转码，并在支持的回放环境中确认杜比视界 / 全景声选项及实际效果。报告默认始终记录 `platform_verified: false`；程序不会自动发布投稿。
 
 ## 安装与启动
 
-自动安装脚本面向 Windows 10/11 64 位，需要 **64 位 Python 3.10+**。AI 引擎使用 Vulkan，需支持 Vulkan 的 GPU 与适配驱动；不要求 CUDA / PyTorch。关闭 AI 超分和插帧后可使用 FFmpeg 基础流程。
+自动安装脚本支持 Windows 10 / 11、**64 位 Python 3.10+**。原片保留 / 转码不需要 AI GPU。RIFE 和 Real-ESRGAN 使用 Vulkan，需要支持 Vulkan 的 GPU 与正常驱动，不要求 CUDA / PyTorch。
 
 ```powershell
 git clone https://github.com/a13718434469/8K-Dolby-Workstation.git
 cd 8K-Dolby-Workstation
-.\setup.bat
-.\run.bat
-```
 
-安装器在项目内创建 `.venv`，从工具原项目下载 FFmpeg、RIFE 及 Real-ESRGAN 的程序和模型。已存在的完整工具会跳过；FFmpeg 下载同时校验官方 SHA256。下载量较大，请预留空间。单个工具包下载最长等待 20 分钟，校验清单最长等待 2 分钟；超时后会报错，可重试或手动安装。
-
-```powershell
-# 仅安装 Python 环境和 FFmpeg；界面中关闭 AI 超分、AI 插帧即可使用
+# 基础环境与 FFmpeg：可先使用保留原片 / 常规转码
 .\setup.bat -CoreOnly
+.\run.bat
 
-# 需要处理配套 RPU 时，额外安装 dovi_tool
+# 完整 AI 环境和可选 dovi_tool
 .\setup.bat -WithDovi
 
-# 只检查现有安装，不安装 Python 依赖、不下载工具
+# 仅检查安装；或在已手动放好工具时仅装依赖并检查
 .\setup.bat -VerifyOnly
-
-# 已手动放好工具时，只安装 Python 依赖并检查工具
 .\setup.bat -SkipDownloads
 ```
 
-首次直接运行 `run.bat` 时，如果缺少可用的 `.venv`，会自动安装基础环境；需要 AI 功能时再运行完整的 `setup.bat`。也可直接运行：
+`setup.bat` 不加参数会安装完整 AI 工具和模型。安装器使用项目内 `.venv`，从原项目官方发行包下载，校验 FFmpeg 官方 SHA256，跳过已完整安装的工具。工具包下载最多等待 20 分钟，校验清单最多等待 2 分钟，失败后可重试或手动安装。首次运行 `run.bat` 缺少可用环境时，会安装基础环境。
+
+桌面入口也可直接运行：
 
 ```powershell
 .\.venv\Scripts\python.exe main.py
 ```
 
-界面中选择视频、输出路径和处理参数后开始。默认启用 AI 超分与插帧、8K / 120fps 目标、SDR 输出和音轨复制；未安装 AI 工具时应先关闭对应选项。目标帧率必须不低于源帧率且不超过 240fps。
+### 桌面使用
+
+1. 选择或拖入视频，异步读取源尺寸、帧率、精度、杜比配置和音轨证据。
+2. 选择方案。已有 8.4 素材优先“保留原片”，需要重新编码时选择对应制作方案。
+3. 指定新的 MP4 输出文件名；高级选项可调整质量、速度、AI 工作尺寸和批次大小。
+4. 使用“检查素材”查看本地提示。重新制作杜比视界时选择与成片配套的 RPU。
+5. 开始处理，完成后查看成片质检和输出目录，再进行平台验收。
+
+窗口支持滚动布局，高级参数与详细日志默认收起。滚动页面不会意外改变下拉选项。程序从实际 PyQt5 包位置设置插件目录，支持含中文的安装路径。
+
+## 画质与色彩流程
+
+**原片保留**直接复制视频码流，检查编码、尺寸、精度、色彩和杜比配置，并比较编码视频负载的 SHA256。它保留原有 RPU 及时序，避免重新调色或插帧后沿用不匹配的元数据。
+
+**原生高精度转码**不先经过 8-bit PNG。以源精度解码，按 SDR / PQ / HLG 信息处理，必要时使用浮点工作格式，最终量化为 4:2:0 10-bit HEVC。HDR → SDR 使用明确色调映射；SDR → HDR 不会恢复原素材不存在的高光或色彩细节。
+
+**AI 增强**按目标帧率计算 RIFE 输出，使用 Real-ESRGAN x4 模型并分批超分 / 编码。它仍使用 8-bit SDR RGB 工作帧，不能代替原生 HDR 母版流程；高于工作尺寸的源素材会缩小。优先保画质时应选择保留原片或原生转码。
+
+**杜比重新制作**中，8.1 使用 PQ 基础层，8.4 使用 HLG 基础层。外部 RPU 必须对应最终画面的色彩、裁切、尺寸、镜头及时序，帧数须完全匹配。改变画面或帧率后不应直接沿用源 RPU；静态模板元数据不等于专业动态调色分析。
+
+x265 默认 CRF 为 18，数值更低通常产生更大文件。较慢预设可能以更多时间提高压缩效率。空间和耗时估算只作参考，不保证画质、精确文件大小或完成时间。
 
 ## 命令行
 
-命令行与桌面界面共用处理引擎，不需要启动 GUI：
+命令行不启动 GUI，与桌面共用核心。默认保留原视频与音轨，沿用源尺寸、帧率和色彩，AI / 插帧默认关闭。手机旋转素材在原生转码时按显示方向确定默认宽高，原片保留则保留编码尺寸与旋转信息：
 
 ```powershell
-# 基础 SDR 编码：关闭 AI，保留源帧率
-.\.venv\Scripts\python.exe cli.py -i "input.mp4" -o "output_sdr.mp4" --no-ai --no-interp --size 1920x1080
+# 已有 B站 8.4 素材：原码流交付与本地检查
+.\.venv\Scripts\python.exe cli.py -i "source_dv84.mp4" -o "delivery.mp4" --route preserve --delivery bilibili
 
-# AI 4K / 120fps，输出 HDR10；音轨重新编码为 AAC
-.\.venv\Scripts\python.exe cli.py -i "input.mp4" -o "output_hdr10.mp4" --size 3840x2160 --fps 120 --color hdr10 --audio-mode aac
+# 要求明确存在且保留 Atmos，证据不足时拒绝继续
+.\.venv\Scripts\python.exe cli.py -i "source_dv84_atmos.mp4" -o "delivery_dual.mp4" --route preserve --delivery bilibili --require-atmos
 
-# Dolby Vision 8.1：RPU 必须与本次最终画面及时序匹配
-.\.venv\Scripts\python.exe cli.py -i "input.mp4" -o "output_dv.mp4" --color dv81 --rpu "matched_RPU.bin"
+# 原生高精度转码，沿用源尺寸 / 帧率 / 色彩
+.\.venv\Scripts\python.exe cli.py -i "master.mov" -o "high_quality.mp4" --route transcode --color source --preset slow --crf 18
 
-# 恢复指定工作目录中的上次任务
+# B站 8.4 制作：RPU 与最终 4K / 60fps HLG 画面配套
+.\.venv\Scripts\python.exe cli.py -i "master.mov" -o "bili_dv84.mp4" --route transcode --delivery bilibili --color dv84 --size 3840x2160 --fps 60 --rpu "matched_P84_RPU.bin" --audio-mode copy
+
+# 外部原始 E-AC-3 JOC 音轨，原码流复制并要求 Atmos 证据
+.\.venv\Scripts\python.exe cli.py -i "source_dv84.mp4" -o "dual.mp4" --route preserve --delivery bilibili --audio "matched_atmos.eac3" --audio-mode copy --require-atmos
+
+# SDR AI 增强，主动启用插帧与超分
+.\.venv\Scripts\python.exe cli.py -i "sdr.mp4" -o "enhanced.mp4" --route enhance --ai --interp --work-size 1920x1080 --size 3840x2160 --fps 60 --color sdr
+
+# 使用原任务完整参数恢复
 .\.venv\Scripts\python.exe cli.py --resume --workspace "workspace"
-
-# 查看完整参数
 .\.venv\Scripts\python.exe cli.py --help
 ```
 
-| 参数 | 用途 |
+| 参数 | 作用 |
 | --- | --- |
-| `-i, --input` / `-o, --output` | 输入视频 / 新的输出 MP4 路径 |
-| `--no-ai` / `--no-interp` | 关闭 AI 超分 / 关闭插帧并保留源帧率 |
-| `--size WIDTHxHEIGHT` / `--fps` | 输出尺寸 / 目标帧率，支持 `60000/1001` 等分数 |
-| `--model` | 超分模型名称，默认 `realesrgan-x4plus` |
-| `--color sdr\|hdr10\|dv81` / `--rpu` | 色彩模式 / 配套 RPU 文件 |
-| `--audio` / `--audio-mode copy\|aac\|eac3\|none` | 可选外部音频 / 音轨处理方式 |
-| `--batch-size` | 每批处理帧数，范围 1–256，默认 64 |
-| `--preset` / `--crf` | x265 编码速度与质量参数 |
-| `--keep-temp` | 保留工作文件，用于检查与排错 |
-| `--workspace` / `--resume` | 选择工作目录 / 恢复该目录中的上次任务 |
+| `-i, --input` / `-o, --output` | 输入 / 新的 MP4 输出路径 |
+| `--route preserve\|transcode\|enhance` | 保留原片 / 原生转码 / AI 增强 |
+| `--delivery general\|bilibili` | 常规交付 / 严格 B站杜比格式检查 |
+| `--color source\|sdr\|hdr10\|hlg\|dv81\|dv84` | 沿用源色彩或明确输出类型 |
+| `--size WIDTHxHEIGHT` / `--fps` | 可选尺寸 / 帧率，支持分数；原片保留沿用源值 |
+| `--ai` / `--interp` | 在增强路线中启用超分 / 插帧 |
+| `--no-ai` / `--no-interp` | 兼容旧命令的关闭选项 |
+| `--work-size WIDTHxHEIGHT` / `--model` | AI 工作尺寸 / 模型 |
+| `--rpu` | 与最终画面及时序匹配的 RPU |
+| `--audio` / `--audio-mode copy\|aac\|eac3\|none` | 外部音频 / 音轨处理方式 |
+| `--require-atmos` | 要求已有 Atmos 证据并保留，不生成 Atmos |
+| `--preset` / `--crf` | x265 速度与质量 |
+| `--batch-size` | 增强路线批次帧数，范围 1–256 |
+| `--keep-temp` | 保留中间文件 |
+| `--workspace` / `--resume` | 工作目录 / 恢复原任务 |
 
-输出尺寸宽高必须是 16–8192 范围内的偶数。所有模式都拒绝覆盖已有输出；恢复时也请保留原输出路径，并确保该文件尚未生成。
+原生转码改变帧率时执行恒定帧率重采样，不自动生成 AI 运动帧；RIFE 插帧需要增强路线。重新编码的输出宽高须为 48–8192 范围内的偶数，等比缩放并补边；更小画面可原码流保留，避免部分 x265 版本的极小尺寸崩溃。所有路线都拒绝覆盖现有输出或源文件；原片保留不使用 AI、插帧或色彩重编码设置。
 
-## 音轨与任务恢复
+## 音轨、元数据与隐私
 
-程序使用输入视频或外部音频的第一条音轨。无音轨的视频可正常输出。`copy` 支持 MP4 可接受的 AAC、AC-3、E-AC-3、MP3 和 ALAC；短音轨保持原长，不缩短视频。AAC / E-AC-3 模式会补齐短音轨并截取到视频时长；E-AC-3 编码最多保留 5.1 声道，更多声道会下混。字幕、附件、章节和额外音轨不在当前输出范围内。
+使用视频或外部音频的第一条音轨。无音轨视频可以输出，但不能成为 Atmos 双标素材。复制支持 MP4 接受的 AAC、AC-3、E-AC-3、MP3、ALAC；短音轨按原长保留，不截短视频。AAC / E-AC-3 重编码会补齐短音轨并按视频时长截取；普通 E-AC-3 最多保留 5.1 声道，更多声道会下混。
 
-暂停在**当前外部命令结束后**生效；当前命令可能仍需较长时间。停止会终止正在执行的外部进程，保留可用处理记录。恢复重用已验证的完成阶段和视频分片，未完成的阶段或批次会重新执行。
+B站交付封装时移除容器附加元数据和章节。本地报告可能含文件名、路径和编码信息，应作为本地工作文件管理。字幕、附件、章节和额外音轨不在当前输出范围内。
 
-Dolby Vision 模式的分片禁用 B 帧重排序，注入 RPU 后重新建立恒定帧率时间戳，并通过 FFmpeg 写入 MP4 所需的杜比配置。最终文件通过帧数、帧率、时长及 Profile 8.1 配置检查后才发布。
+仓库与源码包只应包含代码、测试、文档和必要配置。工具 / 模型、媒体、截图、断点、临时帧、虚拟环境、日志、Cookie 和密钥不应提交。处理与质检不会自动上传媒体或自动发布 B站投稿。
+
+## 成片质检与平台验收
+
+每次成功输出可生成同目录的 `成片.mp4.quality.json`，记录媒体参数、检测工具、目标路线、失败 / 提示项目及依据。`platform_verified` 始终为 `false`，平台实测证据应单独保存。
+
+本地检查包含：
+
+- 编码、尺寸、帧率、帧数、时长、精度和色彩信号。
+- 完整视频和音频解码，避免只凭“封装成功”判断成片有效。整片计帧不使用短时元数据检测超时，仍可随时停止。
+- 保留原片的视频负载 SHA256、杜比配置与色彩一致性。
+- B站路线的 HLG / Profile 8.4、基础层 / RPU / 单层声明和 4:2:0 10-bit。
+- Atmos 编码证据；可选 MediaInfo 补充 JOC 检测，未安装不会自动下载。
+
+技术检查不能自动评判所有 AI 伪影、镜头调色或 RPU 视觉匹配，也不替代真实播放器与平台转码。先用短片检查暗部、高光、色阶、运动边缘、音画同步及支持设备上的 HDR / Atmos 回放，再处理完整作品。
+
+平台双标验收应使用已确认 DV 8.4 + E-AC-3 JOC 的测试片，上传 B站创作中心草稿，等待转码后核对识别结果。草稿上传不等于已完成所有清晰度转码，也不等于公开发布。
+
+## 暂停、停止与恢复
+
+暂停在当前外部命令完成后的安全边界生效，当前编码 / 推理可能仍需一段时间。停止会终止正在执行的处理 / 质检子进程，保留已验证完成的阶段和分片。
+
+任务有独立目录和原子清单，同一工作目录只允许一个写入者。恢复使用原参数与源文件指纹；输入或参数改变时需要新任务。未完成阶段 / 批次会重做，已验证分片继续复用。
 
 ```text
 workspace/
-├── checkpoint.json          # 最近的未完成任务入口
-├── .lock                    # 防止同一工作目录同时写入
+├── checkpoint.json          # 最近未完成任务入口
+├── .lock                    # 工作目录写入锁
 └── jobs/<job_id>/
-    ├── manifest.json        # 参数、输入文件信息、完成阶段与分片记录
-    ├── source/              # 提取的工作帧
-    ├── interpolated/        # 可选插帧结果
-    ├── chunks/              # 已编码并校验的视频分片
-    └── batch_*/             # 当前批次的工作文件
+    ├── manifest.json        # 参数、源指纹、阶段与分片
+    ├── native.mp4           # 原生转码中间结果
+    ├── source/              # 增强路线工作帧
+    ├── interpolated/        # 可选 RIFE 结果
+    ├── chunks/              # 已验证的编码分片
+    └── batch_*/             # 当前增强批次
 ```
 
-界面“恢复上次任务”会恢复保存的参数。命令行 `--resume` 使用对应工作目录的记录；输入内容或参数发生变化时需要新建任务。一个工作目录同时只允许一个任务；并行处理请分别指定 `--workspace`。不要删除要恢复的任务文件。
+清理只处理当前任务拥有的中间文件。增强路线仍可能保存完整帧序列，长片要预留大量空间；保留原片和原生转码不先展开整片 PNG。工作盘、输出盘都要保留空间，保守估算不是最终压缩文件大小。
 
-自动清理模式在阶段完成后移除可再生成的文件，成功后保留任务清单。超分按批次进行，但提取帧和插帧阶段仍会保存完整序列，长视频可能需要大量磁盘空间。界面空间值按未压缩帧和编码中间文件保守估算，不能当作压缩输出大小或精确空间保证；工作盘和输出盘都应保留足够空间。
+## 手动安装与跨平台
 
-## 手动安装与跨平台使用
+程序优先查找 `tools/`，随后查找 `PATH`，AI 模型仍需放在项目目录。自动安装器仅支持 Windows；Linux / macOS 可手动安装相应平台程序与 Python 依赖，使用 CLI。跨平台测试不代表所有桌面环境或驱动都已验收。
 
-可从以下原项目下载工具；保留模型目录，勿只复制 `.exe`：
-
-- [FFmpeg](https://ffmpeg.org/download.html) / [BtbN Windows builds](https://github.com/BtbN/FFmpeg-Builds/releases)：建议使用当前完整版本，需 `ffmpeg` 与 `ffprobe`，支持 `libx265`、AAC、E-AC-3 和所有画面模式必需的 `zscale`。Dolby Vision 还要求 `dovi_rpu`（支持 `compression=0`）及 `setts` 位流过滤器；旧版或精简版可能缺少这些功能，`setup.bat -WithDovi` 会检查并提示升级。
-- [Real-ESRGAN Windows bundle v0.2.5.0](https://github.com/xinntao/Real-ESRGAN/releases/tag/v0.2.5.0)：程序和 `models/` 中的模型文件。
-- [RIFE ncnn Vulkan 20221029](https://github.com/nihui/rife-ncnn-vulkan/releases/tag/20221029)：程序和 `rife-v4.6/` 模型目录。
-- [dovi_tool 2.3.4](https://github.com/quietvoid/dovi_tool/releases/tag/2.3.4)：仅 Dolby Vision 元数据模式需要。
+- [FFmpeg](https://ffmpeg.org/download.html) / [BtbN Windows builds](https://github.com/BtbN/FFmpeg-Builds/releases)：使用完整新版，需 ffmpeg / ffprobe、libx265、AAC、E-AC-3、`zscale`。重新注入 DV 还需支持 `compression=0` 的 `dovi_rpu` 与 `setts`。
+- [Real-ESRGAN Windows v0.2.5.0](https://github.com/xinntao/Real-ESRGAN/releases/tag/v0.2.5.0)：程序与 `models/`。
+- [RIFE ncnn Vulkan 20221029](https://github.com/nihui/rife-ncnn-vulkan/releases/tag/20221029)：程序与 `rife-v4.6/`。
+- [dovi_tool 2.3.4](https://github.com/quietvoid/dovi_tool/releases/tag/2.3.4)：重新注入 RPU 时需要，保留原片不必重生成 RPU。
+- [MediaInfo](https://mediaarea.net/en/MediaInfo)：可选命令行工具，补充 JOC / Atmos 证据。
 
 ```text
 tools/
-├── ffmpeg.exe
-├── ffprobe.exe
+├── ffmpeg.exe / ffprobe.exe
 ├── realesrgan-ncnn-vulkan.exe
 ├── models/
 │   ├── realesrgan-x4plus.bin / .param
 │   ├── realesrgan-x4plus-anime.bin / .param
 │   └── realesr-animevideov3-x4.bin / .param
 ├── rife-ncnn-vulkan.exe
-├── rife-v4.6/
-│   └── flownet.bin / flownet.param
-└── dovi_tool.exe             # 可选
+├── rife-v4.6/flownet.bin / flownet.param
+├── dovi_tool.exe             # 可选
+└── mediainfo.exe             # 可选
 ```
-
-程序优先查找 `tools/`，随后查找 `PATH` 中的可执行文件；AI 模型仍需放在上述项目目录。Linux / macOS 请手动安装对应平台工具和 Python 依赖，使用不带 `.exe` 后缀的程序；自动安装脚本仅支持 Windows，跨平台 CI 验证基础媒体流程，不覆盖所有桌面环境与 GPU 驱动。
 
 ## 开发与验证
 
@@ -158,15 +201,15 @@ tools/
 python -m pip install -r requirements.txt
 python -m unittest discover -s tests -v
 
-# 可选：真实 8K 单帧 / 120fps HDR10 编码测试（需要额外内存）
+# 可选：真实 8K / 120fps HDR10 单帧编码，需额外内存
 $env:DOLBY_RUN_8K_SMOKE = '1'
 python -m unittest discover -s tests -p test_8k.py -v
 ```
 
-媒体回归测试使用 `PATH` 中真实的 FFmpeg / ffprobe，覆盖时长、分数帧率、分片合并、HDR10 信号、音轨、停止与恢复等行为；缺少媒体工具时对应测试会跳过。AI 命令测试使用替代推理结果，不能替代真实 GPU 质量验证。Dolby Vision 还需要外部配套 RPU 和播放器验证。GitHub Actions 在 Ubuntu / Windows、Python 3.10 / 3.12 上安装 FFmpeg 并运行测试；测试过程不下载 AI 工具与模型。
+测试覆盖真实 FFmpeg 文件、分数帧率、HDR / DV 元数据与帧数、音轨负载复制、原生精度、恢复 / 取消、原子输出、B站质检、Atmos 证据和 GUI 启动。原生 DV 测试需要本机 dovi_tool 及相应 FFmpeg 功能，工具缺失会明确跳过。AI 替代推理测试不代替真实 GPU 与长片画质验收。
 
-项目入口为 `main.py`（桌面）、`cli.py`（命令行），共用 `pipeline.py`；安装逻辑集中在 `setup.ps1`。
+GitHub Actions 在 Windows / Ubuntu、Python 3.10 / 3.12 上运行回归。入口是 `main.py`（桌面）、`cli.py`（命令行），核心是 `pipeline.py`（处理）与 `quality.py`（交付检查），安装逻辑在 `setup.ps1`。
 
 ## 许可证
 
-本项目代码采用 [MIT License](LICENSE)。FFmpeg、RIFE、Real-ESRGAN、dovi_tool 及模型遵循各自原项目许可证，不因安装到本项目而改用 MIT。本仓库不捆绑这些第三方程序或模型。
+项目代码采用 [MIT License](LICENSE)。FFmpeg、RIFE、Real-ESRGAN、dovi_tool、MediaInfo 和模型遵循各自许可证。本仓库不捆绑第三方程序 / 模型，也不因安装到项目目录而改变其许可证。
