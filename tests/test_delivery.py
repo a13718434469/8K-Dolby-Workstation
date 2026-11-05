@@ -218,7 +218,7 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(hdr_metadata(result), original)
 
     def test_native_source_size_respects_phone_rotation_without_letterboxing_to_landscape(self):
-        self.make_source(count=2)
+        self.make_source(size="192x128", count=2)
         rotated = self.root / "phone-rotated.mp4"
         command([FFMPEG, "-v", "error", "-display_rotation:v:0", "90", "-i", self.source,
                  "-c", "copy", rotated])
@@ -229,7 +229,7 @@ class DeliveryTests(unittest.TestCase):
         self.assertEqual(abs(matrix["rotation"]), 90)
         result = pipeline.Pipeline(self.config()).run()
         final = video(result)
-        self.assertEqual((final["width"], final["height"]), (48, 64))
+        self.assertEqual((final["width"], final["height"]), (128, 192))
 
     def test_bilibili_delivery_rejects_non_dolby_source_without_publishing(self):
         self.make_source(transfer="smpte2084", codec="libx265")

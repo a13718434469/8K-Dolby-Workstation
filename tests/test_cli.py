@@ -97,10 +97,12 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(video["color_transfer"], "bt709")
 
     def test_sub_block_output_is_rejected_before_an_unstable_encoder_launch(self):
-        result = self.cli("--route", "transcode", "--size", "48x32")
-        self.assertEqual(result.returncode, 1)
-        self.assertIn("至少为 48", result.stderr)
-        self.assertFalse(self.output.exists())
+        for size in ("48x32", "48x64", "64x32"):
+            with self.subTest(size=size):
+                result = self.cli("--route", "transcode", "--size", size)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("编码器", result.stderr)
+                self.assertFalse(self.output.exists())
 
     def test_phone_rotation_uses_display_size_for_native_transcode(self):
         # Stay above tiny-block encoder edge cases; exercise portrait orientation

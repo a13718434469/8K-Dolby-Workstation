@@ -287,8 +287,8 @@ class Pipeline:
         if not all(isinstance(cfg[k], int) and 16 <= cfg[k] <= 8192 and cfg[k] % 2 == 0
                    for k in ("width", "height")):
             raise PipelineError("输出宽高必须是 16 到 8192 之间的偶数")
-        if cfg["route"] != "preserve" and min(cfg["width"], cfg["height"]) < 48:
-            raise PipelineError("为避免编码器在极小画面下崩溃，重新编码的宽高至少为 48；请选择更大输出尺寸，或使用原片保留")
+        if cfg["route"] != "preserve" and (cfg["width"] < 64 or cfg["height"] < 48):
+            raise PipelineError("为避免编码器在极小画面下崩溃，重新编码的宽至少为 64、高至少为 48；请选择更大输出尺寸，或使用原片保留")
         if not 1 <= int(cfg["batch_size"]) <= 256:
             raise PipelineError("batch_size 必须在 1 到 256 之间")
         default = video.with_name(f"{video.stem}_{cfg['width']}x{cfg['height']}_{cfg['color_mode']}.mp4")
