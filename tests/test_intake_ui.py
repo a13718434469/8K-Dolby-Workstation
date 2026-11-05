@@ -16,6 +16,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
+try:
+    from pipeline import find_tool
+    DOVI = find_tool("dovi_tool")
+except FileNotFoundError:
+    DOVI = None
 
 CHILD = r'''
 import json
@@ -43,6 +48,7 @@ messages = []
 for name in ('warning', 'critical', 'information'):
     setattr(QMessageBox, name, lambda *args: messages.append(str(args[-1])) or QMessageBox.Ok)
 QMessageBox.question = lambda *args: QMessageBox.Yes
+QMessageBox.exec_ = lambda self: messages.append(self.text() + '\n' + self.detailedText()) or QMessageBox.Ok
 original_window = main.MainWindow
 failed = []
 
@@ -123,13 +129,100 @@ def whole_original(w):
     assert cfg['video'] == str(fixture / 'whole original.mp4')
     assert not cfg['audio'], 'dropping an ordinary whole clip unexpectedly selected a replacement soundtrack'
     assert cfg['audio_mode'] == 'copy', 'original audio must be retained by default'
-    assert cfg['route'] == 'preserve' and not cfg['ai'] and not cfg['interp'], 'ordinary intake unexpectedly requires enhancement settings'
+    assert cfg['route'] == 'transcode' and not cfg['ai'] and not cfg['interp'], 'ordinary intake should make Dolby without AI settings'
+    assert cfg['delivery'] == 'bilibili' and cfg['color_mode'] == 'dv84'
+    assert cfg['rpu_mode'] == 'auto' and not cfg['rpu'], 'automatic Dolby still requires a manual metadata file'
     assert Path(cfg['output']).suffix.lower() == '.mp4'
     assert Path(cfg['output']).resolve() != (fixture / 'whole original.mp4').resolve()
     assert not w.advanced_toggle.isChecked() and not w.advanced.isVisible(), 'a file drop opened technical settings automatically'
     summary = w.automatic_summary.text()
     assert summary and '原音' in summary, 'smart summary does not explain the automatic original-audio choice'
+    assert '将制作杜比视界' in summary and '普通音轨' in summary
     assert Path(cfg['output']).name in summary, 'smart summary does not identify the automatic output'
+
+
+def automatic_dolby_settings(w):
+    w.load_whole()
+    assert w.config()['hdr_remaster'] == 'auto' and w.config()['hdr_peak_nits'] == 600
+    assert not w.advanced_toggle.isChecked(), 'automatic metadata opened advanced settings'
+    # Controlled parsed dimensions exercise the preset without allocating or
+    # encoding an 8K/120fps video. Real metadata/export has separate scenarios.
+    w.vinfo.update(width=7680, height=4320, display_width=7680, display_height=4320,
+                   fps=120, fps_fraction='120', color_transfer='arib-std-b67')
+    w._preset_explicit = False
+    w.choose_source_preset()
+    cfg = w.config()
+    assert (cfg['width'], cfg['height']) == (3840, 2160) and cfg['fps_override'] == 60
+    assert not cfg['ai'] and not cfg['interp']
+    assert '不重复扩展' in w.automatic_summary.text(), 'HDR input is described as receiving a second SDR expansion'
+    QTest.mouseClick(w.advanced_toggle, Qt.LeftButton)
+    choose_combo_with_keys(w.rpu_mode, 'external')
+    assert w.rpu.isVisible() and w.rpu.isEnabled()
+    w.rpu.set_file(str(fixture / 'manual metadata.bin'))
+    assert w.config()['rpu_mode'] == 'external' and w.config()['rpu']
+    choose_combo_with_keys(w.rpu_mode, 'auto')
+    assert not w.config()['rpu'], 'automatic mode still injects the previously selected external RPU'
+    choose_combo_with_keys(w.color, 'dv81')
+    assert w.config()['rpu_mode'] == 'external', '8.1 incorrectly offers automatic metadata without a supported analysis path'
+    assert not w.rpu_mode.model().item(0).isEnabled(), 'unsupported 8.1 automatic mode is selectable'
+    choose_combo_with_keys(w.color, 'dv84')
+    choose_combo_with_keys(w.rpu_mode, 'auto')
+    assert not w.config()['rpu'] and w.config()['rpu_mode'] == 'auto'
+    choose_combo_with_keys(w.export_preset, 'preserve')
+    assert w.config()['route'] == 'preserve', 'manual original-video preservation is unavailable'
+
+
+def missing_dolby_tool_is_actionable(w):
+    w.load_whole()
+    original = main.find_tool
+    def missing(name):
+        if name == 'dovi_tool':
+            raise FileNotFoundError(name)
+        return original(name)
+    main.find_tool = missing
+    try:
+        target = Path(w.config()['output'])
+        QTest.mouseClick(w.start, Qt.LeftButton)
+        QApplication.processEvents()
+        assert w.worker is None and w.outcome is None, 'missing Dolby tool started a degraded export'
+        assert not target.exists()
+        assert messages and 'setup.bat' in messages[-1] and 'dovi_tool' in messages[-1], 'missing tool has no installation remedy'
+    finally:
+        main.find_tool = original
+
+
+def explicit_source_dynamic_range(w):
+    w.load_whole()
+    assert w.config()['source_transfer_override'] == 'auto'
+    # Simulate an unresolved parsed result after stream and first-frame probing.
+    # No HDR file is invented or encoded by this presentation-contract fixture.
+    unresolved = dict(w.vinfo, color_transfer='unknown', color_primaries='bt2020', color_space='bt2020nc')
+    w.on_probe(w.video.filepath, unresolved, '')
+    assert not w.start.isEnabled(), 'unknown BT.2020 source was silently treated as SDR'
+    assert '源动态范围' in w.automatic_summary.text() and '扩展 SDR' not in w.automatic_summary.text()
+    QTest.mouseClick(w.advanced_toggle, Qt.LeftButton)
+    choose_combo_with_keys(w.source_transfer, 'arib-std-b67')
+    assert w.config()['source_transfer_override'] == 'arib-std-b67' and w.start.isEnabled()
+    assert '不重复扩展' in w.automatic_summary.text() and w.top_status.text() == '可以处理'
+    choose_combo_with_keys(w.export_preset, 'preserve')
+    assert w.config()['source_transfer_override'] == 'auto', 'original-video export sent a forbidden source interpretation override'
+    assert w.source_transfer.currentData() == 'arib-std-b67' and not w.source_transfer.isEnabled(), 'preservation discarded the saved manual interpretation'
+    choose_combo_with_keys(w.export_preset, 'bili_make')
+    assert w.config()['source_transfer_override'] == 'arib-std-b67' and w.source_transfer.isEnabled(), 'returning to production lost the manual source interpretation'
+    saved = dict(w.config())
+    w.restore_config(saved)
+    w.on_probe(w.video.filepath, unresolved, '')
+    assert w.config()['source_transfer_override'] == 'arib-std-b67' and w.start.isEnabled()
+    ok, detail = w.drop([fixture / 'whole original.mp4', fixture / 'replacement.wav'])
+    assert ok, detail
+    assert w.config()['source_transfer_override'] == 'arib-std-b67', 'same-source audio pairing discarded manual source interpretation'
+    ok, detail = w.drop([fixture / 'second video.mp4'])
+    assert ok, detail
+    assert w.config()['source_transfer_override'] == 'auto', 'new source inherited the previous source interpretation'
+    w.on_probe(w.video.filepath, dict(w.vinfo, color_transfer='unspecified', color_primaries='bt2020'), '')
+    assert not w.start.isEnabled()
+    w.select_data(w.export_preset, 'preserve')
+    assert w.start.isEnabled() and w.config()['source_transfer_override'] == 'auto', 'original-video preservation unnecessarily requires color interpretation'
 
 
 def paired_drop(w):
@@ -247,7 +340,7 @@ def choose_combo_with_keys(combo, value):
 
 def picture_settings(w):
     cfg = w.config()
-    keys = ('route', 'width', 'height', 'target_fps', 'color_mode', 'ai', 'interp',
+    keys = ('route', 'width', 'height', 'target_fps', 'color_mode', 'rpu_mode', 'hdr_remaster', 'hdr_peak_nits', 'source_transfer_override', 'ai', 'interp',
             'model', 'preset', 'crf', 'batch_size')
     return {key: cfg[key] for key in keys} | {
         'fps_override': cfg.get('fps_override'),
@@ -306,6 +399,8 @@ def restored_picture_survives_inspection(w):
     toggle_checkbox_with_space(w.interp)
     for combo, value in ((w.resolution, (1920, 1080)), (w.fps, 48),
                          (w.color, 'hlg'), (w.audio_mode, 'aac'),
+                         (w.hdr_remaster, 'off'),
+                         (w.source_transfer, 'bt709'),
                          (w.model, 'realesr-animevideov3'), (w.encoding_preset, 'fast')):
         choose_combo_with_keys(combo, value)
     for spinbox, value in ((w.crf, '21'), (w.batch_size, '8')):
@@ -358,6 +453,9 @@ def asynchronous_validation(w):
 
 def processing_locks_intake(w):
     w.load_whole()
+    # This scenario exercises processing locks independently of the optional
+    # Dolby executable. The default-Dolby route is verified in export scenarios.
+    w.select_data(w.export_preset, 'quality')
     entered = threading.Event()
     class HeldPipeline:
         def __init__(self, cfg, log, progress, stage):
@@ -406,6 +504,35 @@ def paired_drop_finishes_export(w):
     result = inspect_media(target)
     assert result['audio_codec'] in ('aac', 'eac3'), 'replacement audio did not reach the final video'
     assert result['width'] == 192 and result['height'] == 128
+    assert result['dv_profile'] == 8 and result['dv_compatibility'] == 4
+    ok, detail = w.drop([target])
+    assert ok, detail
+    assert w.export_preset.currentData() == 'bili_preserve' and w.config()['route'] == 'preserve', 'a completed compliant Dolby original was unnecessarily remade'
+
+
+def failed_export_keeps_ui_usable(w):
+    w.load_whole()
+    w.select_data(w.export_preset, 'quality')
+    original = main.Pipeline
+    class FailedPipeline:
+        def __init__(self, cfg, **_):
+            pass
+        def set_paused(self, value):
+            pass
+        def run(self):
+            raise RuntimeError('controlled metadata failure for error-dialog coverage')
+    main.Pipeline = FailedPipeline
+    try:
+        QTest.mouseClick(w.start, Qt.LeftButton)
+        spin_until(lambda: w.worker is None and w.outcome is not None, 'error result and input unlock')
+        assert w.outcome[0] == 'error' and 'controlled metadata failure' in w.outcome[1]
+        assert messages and 'controlled metadata failure' in messages[-1], 'instance error dialog did not expose the actual failure'
+        assert w.start.isEnabled() and w.input_group.isEnabled() and w.import_button.isEnabled()
+        assert not Path(w.output.text()).exists(), 'failed task published an output'
+        ok, detail = w.drop([fixture / 'second video.mp4'])
+        assert ok, detail
+    finally:
+        main.Pipeline = original
 
 
 def compatible_native_export(w, source_name, source_codec):
@@ -415,6 +542,7 @@ def compatible_native_export(w, source_name, source_codec):
     assert w.vinfo['codec_name'] == source_codec, 'test did not exercise the intended source codec'
     cfg = w.config()
     assert cfg['route'] == 'transcode', source_name + ' was routed to an MP4 bitstream copy that cannot succeed'
+    assert cfg['color_mode'] == 'dv84' and cfg['rpu_mode'] == 'auto' and not cfg['rpu']
     assert not cfg['ai'] and not cfg['interp'], 'format compatibility unexpectedly enabled AI processing'
     assert (cfg['width'], cfg['height']) == (192, 128)
     target = Path(cfg['output'])
@@ -431,8 +559,9 @@ def compatible_native_export(w, source_name, source_codec):
     assert result['codec_name'] == 'hevc' and result['bit_depth'] == 10
     assert (result['width'], result['height']) == (192, 128)
     assert Fraction(result['fps_fraction']) == 6 and result['total_frames'] == 6
-    assert result['color_transfer'] == 'bt709' and result['color_primaries'] == 'bt709'
-    assert result['color_space'] == 'bt709'
+    assert result['color_transfer'] == 'arib-std-b67' and result['color_primaries'] == 'bt2020'
+    assert result['color_space'] == 'bt2020nc'
+    assert result['dv_profile'] == 8 and result['dv_compatibility'] == 4 and result['dv_rpu_present'] is True
 
 
 def unsupported_copy_gets_native_export(w):
@@ -551,11 +680,14 @@ def truehd_conversion_notice(w):
 
 scenarios = {
     'whole': whole_original, 'pair': paired_drop, 'audio_first': audio_first,
+    'automatic_dolby': automatic_dolby_settings, 'missing_dolby': missing_dolby_tool_is_actionable,
+    'source_transfer': explicit_source_dynamic_range,
     'audio_container': audio_only_container, 'restore': replace_and_restore,
     'audio_from_video': audio_from_video_section, 'multiple_video': reject_multiple_video,
     'invalid_atomic': reject_invalid_atomically, 'output': automatic_and_user_output,
     'async': asynchronous_validation, 'processing': processing_locks_intake,
     'maximized': maximized_window_controls, 'export': paired_drop_finishes_export,
+    'export_failure': failed_export_keeps_ui_usable,
     'atmos_modes': atmos_mode_notice, 'truehd_notice': truehd_conversion_notice,
     'native_compatibility': unsupported_copy_gets_native_export,
     'transport_compatibility': transport_stream_gets_native_export,
@@ -574,6 +706,10 @@ class IntakeUiTests(unittest.TestCase):
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix="dolby-intake-")
         cls.fixture = Path(cls.temp.name).resolve()
+        # Keep the real Qt child isolated without exceeding Windows' 32K
+        # command-line limit as drag/drop scenarios accumulate.
+        cls.child_script = cls.fixture / "intake_scenarios.py"
+        cls.child_script.write_text(f"import sys\nsys.path.insert(0, {str(ROOT)!r})\n" + CHILD, encoding="utf-8")
         def command(*args):
             result = subprocess.run([str(x) for x in args], capture_output=True, text=True,
                                     encoding="utf-8", errors="replace", timeout=30)
@@ -603,7 +739,7 @@ class IntakeUiTests(unittest.TestCase):
         cls.temp.cleanup()
 
     def scenario(self, name):
-        result = subprocess.run([sys.executable, "-c", CHILD, str(self.fixture), name], cwd=ROOT,
+        result = subprocess.run([sys.executable, str(self.child_script), str(self.fixture), name], cwd=ROOT,
                                 env=dict(os.environ, QT_QPA_PLATFORM="offscreen", PYTHONUTF8="1"),
                                 capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=25)
         self.assertEqual(result.returncode, 0, result.stderr[-6000:] + result.stdout[-2000:])
@@ -611,6 +747,15 @@ class IntakeUiTests(unittest.TestCase):
 
     def test_whole_clip_drop_keeps_original_audio_and_prepares_output(self):
         self.scenario("whole")
+
+    def test_automatic_dolby_presets_limits_metadata_and_manual_controls(self):
+        self.scenario("automatic_dolby")
+
+    def test_missing_dolby_tool_explains_installation_without_degraded_output(self):
+        self.scenario("missing_dolby")
+
+    def test_unresolved_bt2020_requires_explicit_source_dynamic_range(self):
+        self.scenario("source_transfer")
 
     def test_same_drop_routes_separate_video_and_audio_independent_of_order(self):
         self.scenario("pair")
@@ -648,12 +793,18 @@ class IntakeUiTests(unittest.TestCase):
     def test_running_worker_locks_drag_intake_and_unlocks_after_stop(self):
         self.scenario("processing")
 
+    def test_failed_export_explains_actual_error_and_allows_another_task(self):
+        self.scenario("export_failure")
+
+    @unittest.skipUnless(DOVI, "dovi_tool required for automatic Dolby export")
     def test_paired_drop_can_finish_export_without_manual_codec_adjustment(self):
         self.scenario("export")
 
+    @unittest.skipUnless(DOVI, "dovi_tool required for automatic Dolby export")
     def test_lossless_mkv_drop_automatically_finishes_compatible_native_export(self):
         self.scenario("native_compatibility")
 
+    @unittest.skipUnless(DOVI, "dovi_tool required for automatic Dolby export")
     def test_h264_transport_stream_drop_automatically_finishes_compatible_native_export(self):
         self.scenario("transport_compatibility")
 

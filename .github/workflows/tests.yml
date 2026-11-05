@@ -43,7 +43,7 @@ jobs:
           ffmpeg -hide_banner -version
           ffprobe -hide_banner -version
       - name: Check Python syntax
-        run: python -m compileall -q main.py app_identity.py pipeline.py quality.py cli.py tests
+        run: python -m compileall -q main.py app_identity.py pipeline.py quality.py dolby_analysis.py hdr_remaster.py cli.py tests
       - name: Run regression suite
         run: python -m unittest discover -s tests -v
 
@@ -69,6 +69,16 @@ jobs:
           ffmpeg -hide_banner -version
           dovi_tool --version
           python -c "import sys; sys.path.insert(0, 'tests'); import test_delivery, test_pipeline; assert test_delivery.HAS_DOVI, 'Dolby delivery tests would be skipped'; assert test_pipeline.HAS_NATIVE_DOVI, 'Native RPU tests would be skipped'"
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Test automatic Dolby analysis and desktop delivery
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          python -m unittest discover -s tests -p test_dolby_analysis.py -v
+          python -m unittest discover -s tests -p test_auto_dolby.py -v
+          python -m unittest discover -s tests -p test_cli.py -v
+          python -m unittest discover -s tests -p test_intake_ui.py -v
       - name: Test native delivery and preservation
         run: python -m unittest discover -s tests -p test_delivery.py -v
       - name: Test RPU compatibility rejection

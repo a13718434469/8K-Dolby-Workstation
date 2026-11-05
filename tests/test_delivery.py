@@ -162,9 +162,9 @@ class DeliveryTests(unittest.TestCase):
         calls = []
         original = runner._run
 
-        def record(cmd):
+        def record(cmd, *args, **kwargs):
             calls.append([str(x) for x in cmd])
-            return original(cmd)
+            return original(cmd, *args, **kwargs)
 
         with patch.object(runner, "_run", side_effect=record):
             result = runner.run()

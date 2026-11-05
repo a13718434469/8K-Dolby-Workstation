@@ -77,7 +77,11 @@ class StartupWindow(OriginalWindow):
         assert "本地技术条件通过" in self.quality_status.text()
         assert "不影响本次常规成片" in self.quality_details.text()
         self.select_data(self.export_preset, "bili_make")
-        assert self.config()["color_mode"] == "dv84" and self.rpu.isEnabled()
+        assert self.config()["color_mode"] == "dv84" and self.config()["rpu_mode"] == "auto"
+        assert not self.rpu.isEnabled(), "automatic Dolby generation still requires an external file"
+        self.select_data(self.rpu_mode, "external")
+        assert self.rpu.isEnabled(), "manual metadata file cannot be selected"
+        self.select_data(self.rpu_mode, "auto")
         # Smart import must choose a usable native route for codecs MP4 cannot
         # copy, and make encoder limits visible before a user starts the job.
         self.vinfo = dict(self.vinfo, codec_name="ffv1", width=192, height=128,
@@ -87,10 +91,11 @@ class StartupWindow(OriginalWindow):
         self.choose_source_preset()
         automatic = self.config()
         assert automatic["route"] == "transcode" and not automatic["ai"] and not automatic["interp"]
+        assert automatic["color_mode"] == "dv84" and automatic["rpu_mode"] == "auto" and not automatic["rpu"]
         assert (automatic["width"], automatic["height"]) == (192, 128)
-        assert "自动转为兼容 MP4" in self.automatic_summary.text()
-        self.select_data(self.fps, 60)
-        assert "保持源尺寸、帧率" not in self.automatic_summary.text(), "manual changes left a misleading automatic summary"
+        assert "将制作杜比视界" in self.automatic_summary.text()
+        self.select_data(self.fps, 24)
+        assert "24 fps" in self.automatic_summary.text(), "manual changes left a misleading automatic summary"
         self.vinfo.update(width=32, height=24, display_width=32, display_height=24)
         self.apply_preset()
         assert not self.start.isEnabled() and "尺寸过小" in self.automatic_summary.text()

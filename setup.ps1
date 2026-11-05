@@ -42,9 +42,11 @@ function Get-ToolDefinitions {
             Files = @('rife-ncnn-vulkan.exe', 'rife-v4.6/flownet.bin', 'rife-v4.6/flownet.param')
         }
     )
-    if ($WithDovi) {
+    # Automatic Dolby Vision is part of the core desktop workflow.
+    # Keep -WithDovi accepted for compatibility with existing installations.
+    & {
         @{
-            Name = 'dovi_tool'; Exe = 'dovi_tool.exe'; Core = $false
+            Name = 'dovi_tool'; Exe = 'dovi_tool.exe'; Core = $true
             Url = 'https://github.com/quietvoid/dovi_tool/releases/download/2.3.4/dovi_tool-2.3.4-x86_64-pc-windows-msvc.zip'
             Files = @('dovi_tool.exe')
         }
@@ -110,8 +112,8 @@ function Initialize-Python {
         & $venvPython -m pip install -r (Join-Path $BaseDir 'requirements.txt')
         if ($LASTEXITCODE -ne 0) { throw 'Python dependency installation failed. Check the pip error above and retry.' }
     }
-    & $venvPython -c 'from PyQt5 import QtCore, QtWidgets; print(QtCore.PYQT_VERSION_STR)'
-    if ($LASTEXITCODE -ne 0) { throw 'PyQt5 import failed. Run setup.bat to repair the environment.' }
+    & $venvPython -c 'from PyQt5 import QtCore, QtWidgets; import numpy; print(QtCore.PYQT_VERSION_STR, numpy.__version__)'
+    if ($LASTEXITCODE -ne 0) { throw 'Python dependencies are incomplete. Run setup.bat to repair the environment.' }
 }
 
 function Test-FFmpegInstallation {
@@ -123,8 +125,8 @@ function Test-FFmpegInstallation {
         if ($encoderText -notmatch ('\b' + $encoder + '\b')) { throw "FFmpeg is missing the required encoder: $encoder" }
     }
     $filterText = (& $ffmpeg -hide_banner -filters 2>&1 | Out-String)
-    if ($LASTEXITCODE -ne 0 -or $filterText -notmatch '\bzscale\b') {
-        throw 'FFmpeg is missing zscale, required by all output modes. Install a current full FFmpeg build from BtbN and replace tools/ffmpeg.exe and tools/ffprobe.exe.'
+    if ($LASTEXITCODE -ne 0 -or $filterText -notmatch '\bzscale\b' -or $filterText -notmatch '\blut3d\b') {
+        throw 'FFmpeg is missing zscale or lut3d. Install a current full FFmpeg build from BtbN and replace tools/ffmpeg.exe and tools/ffprobe.exe.'
     }
     if ($RequireDovi) {
         $bsfText = (& $ffmpeg -hide_banner -bsfs 2>&1 | Out-String)
@@ -173,9 +175,8 @@ function Invoke-WorkstationSetup {
         if (-not (Test-ToolFiles -ToolsDir $toolsDir -Files $definition.Files)) { throw "Verification failed: $($definition.Name)" }
         Write-Host ("Ready: {0}" -f $definition.Name) -ForegroundColor Green
     }
-    Test-FFmpegInstallation -ToolsDir $toolsDir -RequireDovi:$WithDovi
+    Test-FFmpegInstallation -ToolsDir $toolsDir -RequireDovi
     Write-Host 'Setup complete. Start the application with run.bat.' -ForegroundColor Green
-    if (-not $WithDovi) { Write-Host 'Optional Dolby Vision metadata support: setup.bat -WithDovi' }
 }
 
 # Dot-sourcing exposes helpers for offline verification without installing anything.

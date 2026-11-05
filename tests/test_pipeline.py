@@ -227,9 +227,9 @@ class MediaPipelineTests(unittest.TestCase):
             pipeline.Pipeline(self.config(output=str(self.source))).run()
         self.assertEqual(self.source.read_bytes(), original)
 
-    def test_dolby_vision_without_matching_rpu_fails_without_fallback_output(self):
+    def test_external_dolby_vision_without_matching_rpu_fails_without_fallback_output(self):
         with self.assertRaises((ValueError, pipeline.PipelineError)):
-            pipeline.Pipeline(self.config(color_mode="dv81", rpu="")).run()
+            pipeline.Pipeline(self.config(color_mode="dv81", rpu_mode="external", rpu="")).run()
         self.assertFalse(self.output.exists())
 
     def test_failed_encode_resumes_without_skipping_unfinished_stage(self):
@@ -239,12 +239,12 @@ class MediaPipelineTests(unittest.TestCase):
 
         encoded = []
 
-        def fail_encode(cmd):
+        def fail_encode(cmd, *args, **kwargs):
             if "libx265" in cmd:
                 encoded.append(cmd)
                 if len(encoded) == 2:
                     raise pipeline.PipelineError("simulated encoder failure")
-            return real_run(cmd)
+            return real_run(cmd, *args, **kwargs)
 
         with patch.object(first, "_run", side_effect=fail_encode):
             with self.assertRaises(pipeline.PipelineError):
@@ -256,9 +256,9 @@ class MediaPipelineTests(unittest.TestCase):
         resumed_run = resumed._run
         commands = []
 
-        def record(cmd):
+        def record(cmd, *args, **kwargs):
             commands.append(cmd)
-            return resumed_run(cmd)
+            return resumed_run(cmd, *args, **kwargs)
 
         with patch.object(resumed, "_run", side_effect=record):
             self.assert_video(resumed.run())
@@ -270,10 +270,10 @@ class MediaPipelineTests(unittest.TestCase):
         first = pipeline.Pipeline(self.config())
         real_run = first._run
 
-        def cancel_encode(cmd):
+        def cancel_encode(cmd, *args, **kwargs):
             if "libx265" in cmd:
                 raise pipeline.PipelineCancelled("simulated cancellation")
-            return real_run(cmd)
+            return real_run(cmd, *args, **kwargs)
 
         with patch.object(first, "_run", side_effect=cancel_encode):
             with self.assertRaises(pipeline.PipelineCancelled):
@@ -287,10 +287,10 @@ class MediaPipelineTests(unittest.TestCase):
         first = pipeline.Pipeline(self.config())
         real_run = first._run
 
-        def interrupt(cmd):
+        def interrupt(cmd, *args, **kwargs):
             if "libx265" in cmd:
                 raise pipeline.PipelineError("simulated encoder failure")
-            return real_run(cmd)
+            return real_run(cmd, *args, **kwargs)
 
         with patch.object(first, "_run", side_effect=interrupt):
             with self.assertRaises(pipeline.PipelineError):
@@ -342,7 +342,7 @@ class MediaPipelineTests(unittest.TestCase):
                 return str(tools / (name + ".exe"))
             return real_find(name)
 
-        def fake(cmd):
+        def fake(cmd, *args, **kwargs):
             name = Path(cmd[0]).name
             if name.startswith(("rife-ncnn-vulkan", "realesrgan-ncnn-vulkan")):
                 commands.append(cmd)
@@ -358,7 +358,7 @@ class MediaPipelineTests(unittest.TestCase):
                     for source in images:
                         shutil.copy2(source, dest / source.name)
                 return ""
-            return real_run(cmd)
+            return real_run(cmd, *args, **kwargs)
 
         with patch.object(pipeline, "TOOLS_DIR", tools), \
                 patch.object(pipeline, "find_tool", side_effect=tool), \
