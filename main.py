@@ -6,6 +6,7 @@ import threading
 import time
 from pathlib import Path
 
+import PyQt5
 from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
@@ -396,6 +397,11 @@ class MainWindow(QMainWindow):
     @staticmethod
     def select_data(combo, data):
         index = combo.findData(data)
+        if index < 0 and isinstance(data, (tuple, list)):
+            # QVariant converts stored tuples to lists on some PyQt builds.
+            index = next((i for i in range(combo.count())
+                          if isinstance(combo.itemData(i), (tuple, list))
+                          and tuple(combo.itemData(i)) == tuple(data)), -1)
         if index >= 0:
             combo.setCurrentIndex(index)
             return True
@@ -562,6 +568,11 @@ class MainWindow(QMainWindow):
 
 
 def main():
+    # Qt's relocated prefix can lose non-ASCII characters in a Windows venv.
+    # Resolve the installed plugins through Python's Unicode-aware package path.
+    plugins = Path(PyQt5.__file__).resolve().parent / "Qt5" / "plugins"
+    if plugins.is_dir():
+        QApplication.setLibraryPaths([str(plugins)])
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
     window = MainWindow()
