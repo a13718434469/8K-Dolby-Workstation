@@ -29,13 +29,26 @@ workspace/
 *.hevc
 *.h265
 *.eac3
+*.ec3
 *.ac3
 *.aac
 *.m4a
 *.wav
+*.w64
+*.flac
+*.mp3
+*.ogg
+*.opus
 *.bin
 .env
 .env.*
+# User-specific encoder/license/cloud configuration. Never distribute these.
+*.lic
+*.license
+*.dee-profile.json
+*.cloud-job.json
+credentials
+.aws/
 .playwright/
 .playwright-cli/
 browser-profile/

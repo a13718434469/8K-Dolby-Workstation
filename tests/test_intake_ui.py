@@ -40,6 +40,22 @@ from PyQt5.QtWidgets import QApplication, QMessageBox
 fixture = Path(sys.argv[1])
 case = sys.argv[2]
 main.WORKSPACE = fixture / ('preferences-' + case)
+PREFERENCE_CASES = {
+    'prefs_v1_make': (1, 'bili_make', 'bili_dual'),
+    'prefs_v1_bili_preserve': (1, 'bili_preserve', 'bili_dual'),
+    'prefs_v1_preserve': (1, 'preserve', 'preserve'),
+    'prefs_v1_quality': (1, 'quality', 'quality'),
+    'prefs_v1_enhance': (1, 'enhance', 'enhance'),
+    'prefs_v2_make': (2, 'bili_make', 'bili_make'),
+    'prefs_v2_bili_preserve': (2, 'bili_preserve', 'bili_preserve'),
+}
+if case in PREFERENCE_CASES:
+    version, saved_preset, _ = PREFERENCE_CASES[case]
+    main.WORKSPACE.mkdir(parents=True, exist_ok=True)
+    (main.WORKSPACE / 'ui_preferences.json').write_text(json.dumps({
+        'version': version, 'export_preset': saved_preset,
+        'audio_mode': 'aac', 'color_mode': 'hlg', 'crf': 19,
+    }), encoding='utf-8')
 pipeline.WORKSPACE = fixture / ('render-' + case)
 pipeline.CHECKPOINT_FILE = pipeline.WORKSPACE / 'checkpoint.json'
 main.CHECKPOINT_FILE = pipeline.CHECKPOINT_FILE
@@ -128,7 +144,7 @@ def whole_original(w):
     cfg = w.config()
     assert cfg['video'] == str(fixture / 'whole original.mp4')
     assert not cfg['audio'], 'dropping an ordinary whole clip unexpectedly selected a replacement soundtrack'
-    assert cfg['audio_mode'] == 'copy', 'original audio must be retained by default'
+    assert cfg['audio_mode'] == 'atmos_auto' and cfg['require_atmos'], 'default target must generate or preserve real Atmos'
     assert cfg['route'] == 'transcode' and not cfg['ai'] and not cfg['interp'], 'ordinary intake should make Dolby without AI settings'
     assert cfg['delivery'] == 'bilibili' and cfg['color_mode'] == 'dv84'
     assert cfg['rpu_mode'] == 'auto' and not cfg['rpu'], 'automatic Dolby still requires a manual metadata file'
@@ -137,7 +153,7 @@ def whole_original(w):
     assert not w.advanced_toggle.isChecked() and not w.advanced.isVisible(), 'a file drop opened technical settings automatically'
     summary = w.automatic_summary.text()
     assert summary and '原音' in summary, 'smart summary does not explain the automatic original-audio choice'
-    assert '将制作杜比视界' in summary and '普通音轨' in summary
+    assert '将制作杜比视界' in summary and 'Atmos' in summary
     assert Path(cfg['output']).name in summary, 'smart summary does not identify the automatic output'
 
 
@@ -174,6 +190,7 @@ def automatic_dolby_settings(w):
 
 def missing_dolby_tool_is_actionable(w):
     w.load_whole()
+    w.select_data(w.export_preset, 'bili_make')
     original = main.find_tool
     def missing(name):
         if name == 'dovi_tool':
@@ -203,7 +220,7 @@ def explicit_source_dynamic_range(w):
     QTest.mouseClick(w.advanced_toggle, Qt.LeftButton)
     choose_combo_with_keys(w.source_transfer, 'arib-std-b67')
     assert w.config()['source_transfer_override'] == 'arib-std-b67' and w.start.isEnabled()
-    assert '不重复扩展' in w.automatic_summary.text() and w.top_status.text() == '可以处理'
+    assert '不重复扩展' in w.automatic_summary.text() and w.top_status.text() == '请先配置 Atmos 编码器'
     choose_combo_with_keys(w.export_preset, 'preserve')
     assert w.config()['source_transfer_override'] == 'auto', 'original-video export sent a forbidden source interpretation override'
     assert w.source_transfer.currentData() == 'arib-std-b67' and not w.source_transfer.isEnabled(), 'preservation discarded the saved manual interpretation'
@@ -232,7 +249,7 @@ def paired_drop(w):
     cfg = w.config()
     assert cfg['video'] == str(fixture / 'video only.mp4')
     assert cfg['audio'] == str(fixture / 'replacement.wav')
-    assert cfg['audio_mode'] in ('aac', 'eac3'), 'WAV cannot be silently copied into this MP4 route'
+    assert cfg['audio_mode'] == 'atmos_auto' and cfg['require_atmos'], 'paired WAV must enter Atmos generation rather than an ordinary codec fallback'
 
 
 def audio_first(w):
@@ -265,7 +282,7 @@ def replace_and_restore(w):
     QApplication.processEvents()
     assert not w.audio.filepath
     assert not w.config()['audio']
-    assert w.config()['audio_mode'] == 'copy'
+    assert w.config()['audio_mode'] == 'atmos_auto'
     assert w.video.filepath == str(fixture / 'whole original.mp4')
 
 
@@ -493,6 +510,9 @@ def processing_locks_intake(w):
 def paired_drop_finishes_export(w):
     ok, detail = w.drop([fixture / 'video only.mp4', fixture / 'replacement.wav'])
     assert ok, detail
+    # This real encode covers the explicitly selected DV-only route. A
+    # licensed Atmos encoder is a separate integration prerequisite.
+    w.select_data(w.export_preset, 'bili_make')
     target = fixture / 'actual GUI export.mp4'
     w.output.setText(str(target))
     QTest.mouseClick(w.start, Qt.LeftButton)
@@ -505,9 +525,11 @@ def paired_drop_finishes_export(w):
     assert result['audio_codec'] in ('aac', 'eac3'), 'replacement audio did not reach the final video'
     assert result['width'] == 192 and result['height'] == 128
     assert result['dv_profile'] == 8 and result['dv_compatibility'] == 4
+    w._preset_explicit = False
     ok, detail = w.drop([target])
     assert ok, detail
-    assert w.export_preset.currentData() == 'bili_preserve' and w.config()['route'] == 'preserve', 'a completed compliant Dolby original was unnecessarily remade'
+    assert w.export_preset.currentData() == 'bili_dual' and w.config()['route'] == 'preserve', 'a completed compliant Dolby picture was unnecessarily remade for the dual target'
+    assert w.config()['require_atmos'], 'picture preservation must not drop the double-Dolby audio requirement'
 
 
 def failed_export_keeps_ui_usable(w):
@@ -538,6 +560,7 @@ def failed_export_keeps_ui_usable(w):
 def compatible_native_export(w, source_name, source_codec):
     ok, detail = w.drop([fixture / source_name])
     assert ok, detail
+    w.select_data(w.export_preset, 'bili_make')
     assert not w.advanced_toggle.isChecked() and not w.advanced.isVisible(), 'a compatibility decision forced manual settings'
     assert w.vinfo['codec_name'] == source_codec, 'test did not exercise the intended source codec'
     cfg = w.config()
@@ -548,7 +571,7 @@ def compatible_native_export(w, source_name, source_codec):
     target = Path(cfg['output'])
     assert target.suffix.lower() == '.mp4'
     # Use the automatically proposed output and press the actual primary action;
-    # no route, resolution, codec or color setting is adjusted by this test.
+    # dimensions, cadence and picture conversion remain automatic.
     QTest.mouseClick(w.start, Qt.LeftButton)
     spin_until(lambda: w.worker is not None or w.outcome is not None, 'smart compatibility export start')
     spin_until(lambda: w.worker is None and w.outcome is not None, 'smart compatibility export', timeout=15)
@@ -642,6 +665,7 @@ def parsed_audio_fixture(codec):
 
 def atmos_mode_notice(w):
     w.load_whole()
+    w.select_data(w.export_preset, 'bili_make')
     quality, original = parsed_audio_fixture('eac3')
     try:
         ok, detail = w.drop([fixture / 'replacement.wav'], target=w.audio)
@@ -667,6 +691,7 @@ def atmos_mode_notice(w):
 
 def truehd_conversion_notice(w):
     w.load_whole()
+    w.select_data(w.export_preset, 'bili_make')
     quality, original = parsed_audio_fixture('truehd')
     try:
         ok, detail = w.drop([fixture / 'replacement.wav'], target=w.audio)
@@ -676,6 +701,181 @@ def truehd_conversion_notice(w):
         assert '不保留' in w.audio_hint.text() or '无法保留' in w.audio_hint.text()
     finally:
         quality.inspect_audio = original
+
+
+def dual_target_blocks_missing_encoder(w):
+    w.load_whole()
+    assert w.export_preset.currentData() == 'bili_dual'
+    cfg = w.config()
+    assert cfg['require_atmos'] and cfg['audio_mode'] == 'atmos_auto'
+    original_find = main.find_tool
+    main.find_tool = lambda name: 'checked-tool' if name == 'dovi_tool' else original_find(name)
+    w.atmos_backend_status = lambda: {'available': False, 'message': '请配置已授权的 Atmos 编码器'}
+    try:
+        w.refresh_start_state()
+        assert w.top_status.text() == '请先配置 Atmos 编码器'
+        assert '请先配置 Atmos 编码器' in w.stage_label.text() and '请先配置 Atmos 编码器' in w.drop_hint.text()
+        assert '请先配置 Atmos 编码器' in w.notification.text()
+        assert w.start.isEnabled() and w.start.text() == '配置 Atmos…'
+        prior_messages = len(messages)
+        QTest.mouseClick(w.start, Qt.LeftButton)
+        QApplication.processEvents()
+        assert w.worker is None and w.outcome is None and not Path(cfg['output']).exists()
+        assert len(messages) == prior_messages, 'configuration action opened a redundant warning dialog'
+        assert w.advanced_toggle.isChecked() and w.atmos_group.isVisible()
+        assert w.config()['require_atmos'], 'missing encoder silently changed the product target'
+        ok, detail = w.drop([fixture / 'video only.mp4'])
+        assert ok, detail
+        assert '音轨' in w.atmos_preflight_error(w.config())
+        assert '拖入音频' in w.automatic_summary.text()
+        assert w.top_status.text() == '请添加音轨'
+        assert '请添加音轨' in w.stage_label.text() and '请添加音轨' in w.drop_hint.text()
+        assert w.start.text() == '添加音轨…'
+        selected = []
+        w.audio.browse = lambda: selected.append(True)
+        QTest.mouseClick(w.start, Qt.LeftButton)
+        assert selected == [True] and w.worker is None, 'missing-audio action did not open audio selection'
+    finally:
+        main.find_tool = original_find
+
+
+def dual_existing_atmos_bypasses_encoder(w):
+    w.load_whole()
+    quality, original = parsed_audio_fixture('eac3')
+    try:
+        ok, detail = w.drop([fixture / 'replacement.wav'], target=w.audio)
+        assert ok, detail
+        w.atmos_backend_status = lambda: {'available': False, 'message': 'missing encoder'}
+        w.refresh_start_state()
+        assert w.config()['audio_mode'] == 'atmos_auto' and w.config()['require_atmos']
+        assert not w.atmos_preflight_error(w.config()), 'existing confirmed JOC unnecessarily requires an encoder'
+        assert '保留已有 Atmos' in w.automatic_summary.text()
+        assert w.top_status.text() == '可以处理' and w.start.text() == '开始处理'
+        assert '准备就绪' in w.stage_label.text() and '可直接开始处理' in w.drop_hint.text()
+        w.select_data(w.audio_mode, 'aac')
+        assert w.atmos_preflight_error(w.config()), 'dual target accepted an ordinary codec replacement'
+        assert w.top_status.text() == '请调整 Atmos 音频设置' and w.start.text() == '调整音频…'
+    finally:
+        quality.inspect_audio = original
+
+
+def readiness_changes_with_encoder_and_export_target(w):
+    # This UI fixture supplies configuration status only; it never claims that
+    # the encoder is licensed or that new Atmos was actually produced.
+    available = [False]
+    w.atmos_backend_status = lambda: {'available': available[0], 'message': '本机编码设置尚未完成'}
+    w.load_whole()
+    assert w.top_status.text() == '请先配置 Atmos 编码器' and w.start.text() == '配置 Atmos…'
+    available[0] = True
+    w.atmos_settings_changed()
+    assert w.top_status.text() == '可以处理' and w.start.text() == '开始处理'
+    assert '准备就绪' in w.stage_label.text() and '可直接开始处理' in w.drop_hint.text()
+    assert '请先配置' not in w.notification.text(), 'resolved prerequisite left a stale blocker'
+    available[0] = False
+    w.atmos_settings_changed()
+    assert w.top_status.text() == '请先配置 Atmos 编码器'
+    for target in ('preserve', 'quality', 'bili_make'):
+        w.select_data(w.export_preset, target)
+        assert not w.config()['require_atmos']
+        assert w.top_status.text() == '可以处理' and w.start.text() == '开始处理'
+        assert '准备就绪' in w.stage_label.text() and '可直接开始处理' in w.drop_hint.text()
+    w.select_data(w.export_preset, 'bili_dual')
+    assert w.top_status.text() == '请先配置 Atmos 编码器' and w.start.text() == '配置 Atmos…'
+
+
+def cloud_settings_consent_is_per_session(w):
+    QTest.mouseClick(w.atmos_setup, Qt.LeftButton)
+    choose_combo_with_keys(w.atmos_backend, 'aws')
+    assert w.aws_fields.isVisible() and not w.dee_fields.isVisible()
+    assert not w.aws_allow.isChecked()
+    values = {'region': 'ap-southeast-1', 'bucket': 'example-private-audio',
+              'role_arn': 'arn:aws:iam::123456789012:role/MediaConvert',
+              'profile': 'workstation', 'prefix': 'dolby-workstation'}
+    for key, value in values.items():
+        w.aws_inputs[key].setText(value)
+    toggle_checkbox_with_space(w.aws_allow)
+    assert w.config()['cloud_atmos']['allow_upload']
+    w.save_preferences()
+    saved = json.loads(w.settings_file.read_text(encoding='utf-8'))
+    assert saved['cloud_atmos'] == dict(values, allow_upload=False)
+    assert set(saved['cloud_atmos']) == set(values) | {'allow_upload'}, 'unexpected credential fields persisted'
+    w.load_preferences()
+    assert not w.aws_allow.isChecked(), 'cloud upload/charging was enabled from a saved preference'
+    w.select_data(w.atmos_backend, 'dee')
+    assert w.dee_fields.isVisible() and not w.aws_fields.isVisible()
+    w.dee_path.set_file('C:/licensed-dee/encoder.exe')
+    w.dee_profile.set_file('C:/licensed-dee/profile.json')
+    assert w.config()['dee_profile'].endswith('profile.json')
+
+
+def cloud_resume_requires_fresh_consent(w):
+    w.load_whole()
+    saved = dict(w.config(), atmos_backend='aws', cloud_atmos={
+        'region': 'ap-southeast-1', 'bucket': 'example-private-audio',
+        'role_arn': 'arn:aws:iam::123456789012:role/MediaConvert',
+        'profile': 'workstation', 'prefix': 'dolby-workstation', 'allow_upload': True})
+    captures = []
+    w.begin = lambda cfg: captures.append(cfg)
+    original = main.load_checkpoint
+    main.load_checkpoint = lambda: {'cfg': saved}
+    try:
+        w.resume_previous()
+        assert not captures and not w.aws_allow.isChecked(), 'checkpoint silently enabled cloud charges'
+        assert w.aws_fields.isVisible() and w.advanced_toggle.isChecked()
+        toggle_checkbox_with_space(w.aws_allow)
+        w.resume_previous()
+        assert captures and captures[0]['cloud_atmos']['allow_upload'] and captures[0]['resume']
+        # A completed copy stage does not need a cloud upload grant. The engine
+        # receives False and remains responsible for rechecking the real source.
+        w.aws_allow.setChecked(False)
+        main.load_checkpoint = lambda: {'cfg': saved, 'atmos_audio': {'generated': False, 'method': 'source_stream_copy'}}
+        captures.clear()
+        w.resume_previous()
+        assert captures and not captures[0]['cloud_atmos']['allow_upload']
+    finally:
+        main.load_checkpoint = original
+
+
+def preferences_migrate_only_legacy_dolby_defaults(w):
+    version, saved_preset, expected_preset = PREFERENCE_CASES[case]
+    assert w.export_preset.currentData() == expected_preset, 'startup did not respect the preference migration rule'
+    cfg = w.config()
+    migrated = version == 1 and saved_preset in ('bili_make', 'bili_preserve')
+    if migrated:
+        assert cfg['audio_mode'] == 'atmos_auto' and cfg['require_atmos'] and cfg['color_mode'] == 'dv84'
+    else:
+        assert cfg['audio_mode'] == 'aac' and not cfg['require_atmos'], 'explicit non-dual preferences were upgraded unexpectedly'
+    assert w.crf.value() == 19, 'migration discarded unrelated preferences'
+    w.load_whole()
+    assert w.export_preset.currentData() == expected_preset, 'first import overrode the persisted or migrated target'
+    if migrated:
+        assert w.config()['audio_mode'] == 'atmos_auto' and w.config()['require_atmos']
+    w.save_preferences()
+    saved = json.loads(w.settings_file.read_text(encoding='utf-8'))
+    assert saved['version'] == 2 and saved['export_preset'] == expected_preset
+    restarted = original_window()
+    try:
+        assert restarted.export_preset.currentData() == expected_preset, 'saved v2 target did not survive reopening'
+        assert restarted.config()['require_atmos'] == migrated
+    finally:
+        restarted.close()
+
+
+def legacy_job_restore_does_not_migrate_target(w):
+    w.load_whole()
+    original = main.load_checkpoint
+    saved = dict(w.config(), route='preserve', delivery='bilibili',
+                 require_atmos=False, audio_mode='copy', color_mode='dv84')
+    captures = []
+    w.begin = lambda cfg: captures.append(cfg)
+    main.load_checkpoint = lambda: {'cfg': saved}
+    try:
+        w.resume_previous()
+        assert w.export_preset.currentData() == 'bili_preserve'
+        assert w.config()['audio_mode'] == 'copy' and not w.config()['require_atmos']
+        assert captures == [dict(saved, resume=True)], 'legacy task parameters were migrated with preferences'
+    finally:
+        main.load_checkpoint = original
 
 
 scenarios = {
@@ -693,7 +893,14 @@ scenarios = {
     'transport_compatibility': transport_stream_gets_native_export,
     'same_source_settings': same_source_keeps_manual_picture_settings,
     'restored_picture': restored_picture_survives_inspection,
+    'dual_missing': dual_target_blocks_missing_encoder,
+    'dual_existing': dual_existing_atmos_bypasses_encoder,
+    'readiness': readiness_changes_with_encoder_and_export_target,
+    'cloud_settings': cloud_settings_consent_is_per_session,
+    'cloud_resume': cloud_resume_requires_fresh_consent,
+    'legacy_job': legacy_job_restore_does_not_migrate_target,
 }
+scenarios.update({name: preferences_migrate_only_legacy_dolby_defaults for name in PREFERENCE_CASES})
 main.MainWindow = IntakeWindow
 result = main.main()
 sys.exit(1 if failed else result)
@@ -747,6 +954,35 @@ class IntakeUiTests(unittest.TestCase):
 
     def test_whole_clip_drop_keeps_original_audio_and_prepares_output(self):
         self.scenario("whole")
+
+    def test_dual_target_blocks_missing_encoder_and_missing_audio(self):
+        self.scenario("dual_missing")
+
+    def test_dual_target_preserves_confirmed_atmos_without_encoder(self):
+        self.scenario("dual_existing")
+
+    def test_readiness_tracks_configuration_and_leaves_other_targets_usable(self):
+        self.scenario("readiness")
+
+    def test_cloud_settings_never_restore_upload_and_charging_consent(self):
+        self.scenario("cloud_settings")
+
+    def test_resuming_cloud_task_requires_this_session_consent(self):
+        self.scenario("cloud_resume")
+
+    def test_legacy_dolby_preferences_upgrade_to_double_dolby_on_first_start(self):
+        for case in ("prefs_v1_make", "prefs_v1_bili_preserve"):
+            with self.subTest(case=case):
+                self.scenario(case)
+
+    def test_legacy_non_dolby_and_explicit_v2_targets_survive_start_and_import(self):
+        for case in ("prefs_v1_preserve", "prefs_v1_quality", "prefs_v1_enhance",
+                     "prefs_v2_make", "prefs_v2_bili_preserve"):
+            with self.subTest(case=case):
+                self.scenario(case)
+
+    def test_restoring_legacy_job_keeps_its_original_single_dolby_target(self):
+        self.scenario("legacy_job")
 
     def test_automatic_dolby_presets_limits_metadata_and_manual_controls(self):
         self.scenario("automatic_dolby")
