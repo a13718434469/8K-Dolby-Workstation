@@ -1,0 +1,558 @@
+"""Exercise desktop intake through real Qt drag/drop, buttons and key events.
+
+Each scenario runs in a separate GUI process. This avoids QApplication versus
+QCoreApplication lifetime conflicts and keeps native dialogs out of CI runs.
+"""
+import importlib.util
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+
+ROOT = Path(__file__).resolve().parents[1]
+FFMPEG = shutil.which("ffmpeg")
+FFPROBE = shutil.which("ffprobe")
+
+CHILD = r'''
+import json
+import sys
+import threading
+import time
+import traceback
+from fractions import Fraction
+from pathlib import Path
+import main
+import pipeline
+from PyQt5.QtCore import Qt, QMimeData, QPoint, QPointF, QTimer, QUrl
+from PyQt5.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
+from PyQt5.QtTest import QTest
+from PyQt5.QtWidgets import QApplication, QMessageBox
+
+fixture = Path(sys.argv[1])
+case = sys.argv[2]
+main.WORKSPACE = fixture / ('preferences-' + case)
+pipeline.WORKSPACE = fixture / ('render-' + case)
+pipeline.CHECKPOINT_FILE = pipeline.WORKSPACE / 'checkpoint.json'
+main.CHECKPOINT_FILE = pipeline.CHECKPOINT_FILE
+main.load_checkpoint = lambda: None
+messages = []
+for name in ('warning', 'critical', 'information'):
+    setattr(QMessageBox, name, lambda *args: messages.append(str(args[-1])) or QMessageBox.Ok)
+QMessageBox.question = lambda *args: QMessageBox.Yes
+original_window = main.MainWindow
+failed = []
+
+
+def spin_until(predicate, label, timeout=8):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        QApplication.processEvents()
+        if predicate():
+            return
+        QTest.qWait(5)
+    raise AssertionError('Timed out waiting for ' + label)
+
+
+class IntakeWindow(original_window):
+    def __init__(self):
+        super().__init__()
+        self.import_events = []
+        self.intake_finished.connect(lambda ok, detail: self.import_events.append((bool(ok), str(detail))))
+        QTimer.singleShot(50, self.execute_scenario)
+
+    def drop(self, paths, target=None, wait=True):
+        widget = target if target is not None else self
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(p)) for p in paths])
+        before = len(self.import_events)
+        enter = QDragEnterEvent(QPoint(12, 12), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+        QApplication.sendEvent(widget, enter)
+        if enter.isAccepted():
+            move = QDragMoveEvent(QPoint(12, 12), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+            QApplication.sendEvent(widget, move)
+            event = QDropEvent(QPointF(12, 12), Qt.CopyAction, mime, Qt.LeftButton, Qt.NoModifier)
+            QApplication.sendEvent(widget, event)
+        if wait:
+            spin_until(lambda: len(self.import_events) > before and not self.intake_busy,
+                       'drop validation: ' + ', '.join(p.name for p in paths))
+            return self.import_events[-1]
+        QApplication.processEvents()
+        return enter.isAccepted()
+
+    def state(self):
+        return (self.video.filepath, self.audio.filepath, self.output.text())
+
+    def load_whole(self):
+        ok, detail = self.drop([fixture / 'whole original.mp4'])
+        assert ok, detail
+        assert self.video.filepath == str(fixture / 'whole original.mp4')
+        assert self.vinfo is not None and self.start.isEnabled()
+
+    def execute_scenario(self):
+        try:
+            scenarios[case](self)
+            print('INTAKE_UI_OK:' + case, flush=True)
+        except BaseException:
+            failed.append(traceback.format_exc())
+            print(failed[-1], file=sys.stderr, flush=True)
+        finally:
+            if self.worker is not None:
+                self.worker.request_stop()
+                try:
+                    spin_until(lambda: self.worker is None, 'worker shutdown', timeout=5)
+                except BaseException:
+                    failed.append(traceback.format_exc())
+            self.close()
+            try:
+                spin_until(lambda: not self.intakes and not self.probes, 'inspection shutdown', timeout=5)
+            except BaseException:
+                failed.append(traceback.format_exc())
+            QApplication.processEvents()
+            QApplication.instance().quit()
+
+
+def whole_original(w):
+    assert not w.start.isEnabled(), 'start enabled without a valid source'
+    assert not w.advanced_toggle.isChecked() and not w.advanced.isVisible(), 'advanced parameters are forced on a new user'
+    w.load_whole()
+    cfg = w.config()
+    assert cfg['video'] == str(fixture / 'whole original.mp4')
+    assert not cfg['audio'], 'dropping an ordinary whole clip unexpectedly selected a replacement soundtrack'
+    assert cfg['audio_mode'] == 'copy', 'original audio must be retained by default'
+    assert cfg['route'] == 'preserve' and not cfg['ai'] and not cfg['interp'], 'ordinary intake unexpectedly requires enhancement settings'
+    assert Path(cfg['output']).suffix.lower() == '.mp4'
+    assert Path(cfg['output']).resolve() != (fixture / 'whole original.mp4').resolve()
+    assert not w.advanced_toggle.isChecked() and not w.advanced.isVisible(), 'a file drop opened technical settings automatically'
+    summary = w.automatic_summary.text()
+    assert summary and '原音' in summary, 'smart summary does not explain the automatic original-audio choice'
+    assert Path(cfg['output']).name in summary, 'smart summary does not identify the automatic output'
+
+
+def paired_drop(w):
+    # Audio comes first in the MIME list: dispatch must inspect all files.
+    ok, detail = w.drop([fixture / 'replacement.wav', fixture / 'video only.mp4'])
+    assert ok, detail
+    cfg = w.config()
+    assert cfg['video'] == str(fixture / 'video only.mp4')
+    assert cfg['audio'] == str(fixture / 'replacement.wav')
+    assert cfg['audio_mode'] in ('aac', 'eac3'), 'WAV cannot be silently copied into this MP4 route'
+
+
+def audio_first(w):
+    ok, detail = w.drop([fixture / 'replacement.wav'])
+    assert ok, detail
+    assert not w.video.filepath
+    assert w.audio.filepath == str(fixture / 'replacement.wav')
+    assert not w.start.isEnabled(), 'audio-only state must not start a video job'
+    w.load_whole()
+    assert w.config()['audio'] == str(fixture / 'replacement.wav'), 'adding video silently discarded audio selected first'
+
+
+def audio_only_container(w):
+    ok, detail = w.drop([fixture / 'audio inside.mp4'])
+    assert ok, detail
+    assert not w.video.filepath, 'an .mp4 extension was mistaken for a video track'
+    assert w.audio.filepath == str(fixture / 'audio inside.mp4')
+    assert not w.start.isEnabled()
+    w.load_whole()
+    assert w.config()['audio'] == str(fixture / 'audio inside.mp4')
+
+
+def replace_and_restore(w):
+    w.load_whole()
+    ok, detail = w.drop([fixture / 'replacement.wav'], target=w.audio)
+    assert ok, detail
+    assert w.audio.filepath == str(fixture / 'replacement.wav')
+    assert w.audio_clear.isEnabled()
+    QTest.mouseClick(w.audio_clear, Qt.LeftButton)
+    QApplication.processEvents()
+    assert not w.audio.filepath
+    assert not w.config()['audio']
+    assert w.config()['audio_mode'] == 'copy'
+    assert w.video.filepath == str(fixture / 'whole original.mp4')
+
+
+def audio_from_video_section(w):
+    ok, detail = w.drop([fixture / 'video only.mp4'], target=w.video)
+    assert ok, detail
+    ok, detail = w.drop([fixture / 'whole original.mp4'], target=w.audio)
+    assert ok, detail
+    assert w.config()['video'] == str(fixture / 'video only.mp4')
+    assert w.config()['audio'] == str(fixture / 'whole original.mp4'), 'audio section must accept a video container as an audio source'
+
+
+def reject_multiple_video(w):
+    w.load_whole()
+    before = w.state()
+    ok, detail = w.drop([fixture / 'video only.mp4', fixture / 'second video.mp4'])
+    assert not ok, 'multiple videos were accepted while only one can be represented'
+    assert w.state() == before, 'multiple-video drop silently replaced or discarded a source'
+    assert detail and w.notification.text(), 'rejection must explain what the user needs to change'
+    ok, detail = w.drop([fixture / 'replacement.wav', fixture / 'audio inside.mp4'])
+    assert not ok and detail, 'multiple audio sources were silently truncated'
+    assert w.state() == before
+
+
+def reject_invalid_atomically(w):
+    w.load_whole()
+    ok, detail = w.drop([fixture / 'replacement.wav'], target=w.audio)
+    assert ok, detail
+    before = w.state()
+    ok, detail = w.drop([fixture / 'broken.mp4'])
+    assert not ok and detail
+    assert w.state() == before, 'invalid input replaced a valid source or its output'
+    ok, detail = w.drop([fixture / 'second video.mp4', fixture / 'broken.wav'])
+    assert not ok and detail
+    assert w.state() == before, 'multi-file intake committed its valid half before validation finished'
+    assert w.start.isEnabled(), 'a rejected file left the previously valid source unusable'
+
+
+def automatic_and_user_output(w):
+    w.load_whole()
+    initial = w.output.text()
+    ok, detail = w.drop([fixture / 'second video.mp4'])
+    assert ok, detail
+    assert w.output.text() != initial, 'automatic output stayed attached to the previous source'
+    custom = str(fixture / 'chosen final output.mp4')
+    w.output.setFocus()
+    QApplication.clipboard().setText(custom)
+    QTest.keyClick(w.output, Qt.Key_A, Qt.ControlModifier)
+    QTest.keyClick(w.output, Qt.Key_V, Qt.ControlModifier)
+    QApplication.processEvents()
+    assert w.output.text() == custom, 'keyboard editing did not reach output field'
+    ok, detail = w.drop([fixture / 'whole original.mp4'])
+    assert ok, detail
+    assert w.output.text() == custom, 'a new source overwrote the user-selected output path'
+
+
+def asynchronous_validation(w):
+    import quality
+    original = quality.inspect_media
+    released = threading.Event()
+    entered = threading.Event()
+    heartbeat = []
+    def delayed(*args, **kwargs):
+        entered.set()
+        if not released.wait(1.5):
+            raise AssertionError('the GUI event loop could not release the inspector')
+        return original(*args, **kwargs)
+    quality.inspect_media = delayed
+    started = time.monotonic()
+    QTimer.singleShot(50, lambda: (heartbeat.append(time.monotonic()), released.set()))
+    try:
+        ok, detail = w.drop([fixture / 'whole original.mp4'])
+        assert ok, detail
+        assert entered.is_set(), 'test did not exercise the real asynchronous inspector'
+        assert heartbeat and heartbeat[0] - started < 1, 'media inspection blocked the GUI thread'
+    finally:
+        released.set()
+        quality.inspect_media = original
+
+
+def processing_locks_intake(w):
+    w.load_whole()
+    entered = threading.Event()
+    class HeldPipeline:
+        def __init__(self, cfg, log, progress, stage):
+            self.stop = threading.Event()
+        def cancel(self):
+            self.stop.set()
+        def set_paused(self, value):
+            pass
+        def run(self):
+            entered.set()
+            if not self.stop.wait(6):
+                raise RuntimeError('test worker was not stopped')
+            raise main.PipelineCancelled('test stop')
+    original = main.Pipeline
+    main.Pipeline = HeldPipeline
+    try:
+        QTest.mouseClick(w.start, Qt.LeftButton)
+        spin_until(lambda: entered.is_set() and w.worker is not None, 'actual worker start')
+        before = w.state()
+        assert not w.start.isEnabled()
+        w.drop([fixture / 'second video.mp4'], wait=False)
+        QTest.qWait(50)
+        assert w.state() == before, 'processing source changed during a live worker'
+        assert not w.import_files([str(fixture / 'replacement.wav')]), 'public intake bypassed the processing lock'
+        assert w.state() == before
+        QTest.mouseClick(w.stop, Qt.LeftButton)
+        spin_until(lambda: w.worker is None, 'stop and unlock')
+        ok, detail = w.drop([fixture / 'second video.mp4'])
+        assert ok, detail
+        assert w.video.filepath == str(fixture / 'second video.mp4')
+    finally:
+        main.Pipeline = original
+
+
+def paired_drop_finishes_export(w):
+    ok, detail = w.drop([fixture / 'video only.mp4', fixture / 'replacement.wav'])
+    assert ok, detail
+    target = fixture / 'actual GUI export.mp4'
+    w.output.setText(str(target))
+    QTest.mouseClick(w.start, Qt.LeftButton)
+    spin_until(lambda: w.worker is not None or w.outcome is not None, 'export start')
+    spin_until(lambda: w.worker is None and w.outcome is not None, 'actual GUI export', timeout=15)
+    assert w.outcome[0] == 'ok', 'paired media could not be exported with the automatically selected settings: ' + str(w.outcome)
+    assert target.is_file() and target.stat().st_size > 0
+    from quality import inspect_media
+    result = inspect_media(target)
+    assert result['audio_codec'] in ('aac', 'eac3'), 'replacement audio did not reach the final video'
+    assert result['width'] == 192 and result['height'] == 128
+
+
+def compatible_native_export(w, source_name, source_codec):
+    ok, detail = w.drop([fixture / source_name])
+    assert ok, detail
+    assert not w.advanced_toggle.isChecked() and not w.advanced.isVisible(), 'a compatibility decision forced manual settings'
+    assert w.vinfo['codec_name'] == source_codec, 'test did not exercise the intended source codec'
+    cfg = w.config()
+    assert cfg['route'] == 'transcode', source_name + ' was routed to an MP4 bitstream copy that cannot succeed'
+    assert not cfg['ai'] and not cfg['interp'], 'format compatibility unexpectedly enabled AI processing'
+    assert (cfg['width'], cfg['height']) == (192, 128)
+    target = Path(cfg['output'])
+    assert target.suffix.lower() == '.mp4'
+    # Use the automatically proposed output and press the actual primary action;
+    # no route, resolution, codec or color setting is adjusted by this test.
+    QTest.mouseClick(w.start, Qt.LeftButton)
+    spin_until(lambda: w.worker is not None or w.outcome is not None, 'smart compatibility export start')
+    spin_until(lambda: w.worker is None and w.outcome is not None, 'smart compatibility export', timeout=15)
+    assert w.outcome[0] == 'ok', 'automatic compatibility conversion failed for ' + source_name + ': ' + str(w.outcome)
+    assert target.is_file() and target.stat().st_size > 0
+    from quality import inspect_media
+    result = inspect_media(target, count_frames=True)
+    assert result['codec_name'] == 'hevc' and result['bit_depth'] == 10
+    assert (result['width'], result['height']) == (192, 128)
+    assert Fraction(result['fps_fraction']) == 6 and result['total_frames'] == 6
+    assert result['color_transfer'] == 'bt709' and result['color_primaries'] == 'bt709'
+    assert result['color_space'] == 'bt709'
+
+
+def unsupported_copy_gets_native_export(w):
+    compatible_native_export(w, 'lossless FFV1.mkv', 'ffv1')
+
+
+def transport_stream_gets_native_export(w):
+    compatible_native_export(w, 'broadcast H264.ts', 'h264')
+
+
+def maximized_window_controls(w):
+    assert w.isMaximized() and not w.isFullScreen(), 'startup must be a normal maximized application, keeping the desktop work area'
+    flags = w.windowFlags()
+    assert flags & Qt.WindowTitleHint, 'native title bar was removed'
+    assert flags & Qt.WindowSystemMenuHint, 'native system menu was removed'
+    assert not flags & Qt.FramelessWindowHint, 'application must not replace the normal desktop frame'
+    assert (Path(main.__file__).resolve().parent / 'assets' / 'app.svg').is_file(), 'application icon asset is missing'
+    assert not QApplication.windowIcon().isNull(), 'application has no icon'
+    assert not w.windowIcon().isNull(), 'desktop window has no icon'
+    assert len(QApplication.windowIcon().availableSizes()) >= 3, 'application icon is not available at desktop sizes'
+    assert w.window_toggle.isVisible(), 'maximized window has no visible restore control'
+    def font_pixels(widget):
+        font = widget.font()
+        return font.pixelSize() if font.pixelSize() > 0 else font.pointSizeF() * widget.logicalDpiY() / 72
+    assert font_pixels(w) >= 15.5, 'normal application text is below 16px / 12pt'
+    assert font_pixels(w.output) >= 15.5, 'output text remains too small'
+    assert font_pixels(w.start) >= 15.5 and w.start.height() >= 40, 'primary action is too small to read or operate'
+    w.activateWindow()
+    w.setFocus()
+    QApplication.processEvents()
+    QTest.mouseClick(w.window_toggle, Qt.LeftButton)
+    spin_until(lambda: not w.isMaximized() and not w.isFullScreen(), 'restore normal window')
+    w.resize(1000, 640)
+    QApplication.processEvents()
+    assert w.height() <= 680, 'larger type forces the window beyond a small desktop'
+    assert w.start.isVisible(), 'primary action disappeared on a small window'
+    assert w.start.mapTo(w, QPoint(0, 0)).y() + w.start.height() <= w.height(), 'primary action is clipped below the window'
+    QTest.mouseClick(w.window_toggle, Qt.LeftButton)
+    spin_until(lambda: w.isMaximized() and not w.isFullScreen(), 'maximize normal application')
+    QTest.keyClick(w, Qt.Key_F11)
+    QApplication.processEvents()
+    assert w.isMaximized() and not w.isFullScreen(), 'F11 unexpectedly entered exclusive fullscreen'
+    QTest.keyClick(w, Qt.Key_Escape)
+    QApplication.processEvents()
+    assert w.isVisible() and w.isMaximized() and not w.isFullScreen(), 'Escape changed normal application windowing'
+
+
+def audio_mode_key(w, value):
+    if not w.advanced.isVisible():
+        QTest.mouseClick(w.advanced_toggle, Qt.LeftButton)
+        QApplication.processEvents()
+    index = w.audio_mode.findData(value)
+    assert index >= 0, 'requested audio mode is unavailable'
+    w.audio_mode.setFocus()
+    QTest.keyClick(w.audio_mode, Qt.Key_Home)
+    for _ in range(index):
+        QTest.keyClick(w.audio_mode, Qt.Key_Down)
+    QApplication.processEvents()
+    assert w.audio_mode.currentData() == value, 'audio selection did not receive the user key events'
+
+
+def parsed_audio_fixture(codec):
+    # Media decoding/detection has its own real-file tests. Here a controlled
+    # parsed-result fixture drives presentation of an already-confirmed source;
+    # this does not create or claim to create an Atmos-encoded audio file.
+    import quality
+    original = quality.inspect_audio
+    def inspected(path, *args, **kwargs):
+        info = original(path, *args, **kwargs)
+        if Path(path).resolve() == (fixture / 'replacement.wav').resolve():
+            profile = 'Dolby Digital Plus + Dolby Atmos' if codec == 'eac3' else 'Dolby TrueHD + Dolby Atmos'
+            info.update(audio_codec=codec, audio_profile=profile, atmos='confirmed', atmos_evidence='UI parsed-result fixture')
+            info['audio_streams'] = [dict(info['audio_streams'][0], codec_name=codec, profile=profile)]
+        return info
+    quality.inspect_audio = inspected
+    return quality, original
+
+
+def atmos_mode_notice(w):
+    w.load_whole()
+    quality, original = parsed_audio_fixture('eac3')
+    try:
+        ok, detail = w.drop([fixture / 'replacement.wav'], target=w.audio)
+        assert ok, detail
+        assert w.audio_mode.currentData() == 'copy'
+        audio_mode_key(w, 'aac')
+        assert '将保留原码流' not in w.audio_hint.text(), 'AAC selection still promises Atmos bitstream preservation'
+        assert '不保留' in w.audio_hint.text() or '无法保留' in w.audio_hint.text(), 'Atmos loss must be explained before encoding'
+        # A late source probe after resume must not reset an intentional codec.
+        saved = dict(w.config())
+        saved['audio_mode'] = 'aac'
+        w.video.set_file('')
+        w.restore_config(saved)
+        QTest.qWait(450)
+        spin_until(lambda: not w.probes and not w.probe_timer.isActive(), 'restored source inspection')
+        assert w.audio_mode.currentData() == 'aac', 'late source inspection overwrote restored audio settings'
+        audio_mode_key(w, 'none')
+        assert '将保留原码流' not in w.audio_hint.text(), 'muted export still promises an Atmos audio track'
+        assert not w.config()['audio'], 'muted export still selected a replacement audio file'
+    finally:
+        quality.inspect_audio = original
+
+
+def truehd_conversion_notice(w):
+    w.load_whole()
+    quality, original = parsed_audio_fixture('truehd')
+    try:
+        ok, detail = w.drop([fixture / 'replacement.wav'], target=w.audio)
+        assert ok, detail
+        assert w.audio_mode.currentData() == 'aac', 'an unsupported TrueHD copy was selected automatically'
+        assert '将保留原码流' not in w.audio_hint.text(), 'TrueHD conversion incorrectly promises Atmos preservation'
+        assert '不保留' in w.audio_hint.text() or '无法保留' in w.audio_hint.text()
+    finally:
+        quality.inspect_audio = original
+
+
+scenarios = {
+    'whole': whole_original, 'pair': paired_drop, 'audio_first': audio_first,
+    'audio_container': audio_only_container, 'restore': replace_and_restore,
+    'audio_from_video': audio_from_video_section, 'multiple_video': reject_multiple_video,
+    'invalid_atomic': reject_invalid_atomically, 'output': automatic_and_user_output,
+    'async': asynchronous_validation, 'processing': processing_locks_intake,
+    'maximized': maximized_window_controls, 'export': paired_drop_finishes_export,
+    'atmos_modes': atmos_mode_notice, 'truehd_notice': truehd_conversion_notice,
+    'native_compatibility': unsupported_copy_gets_native_export,
+    'transport_compatibility': transport_stream_gets_native_export,
+}
+main.MainWindow = IntakeWindow
+result = main.main()
+sys.exit(1 if failed else result)
+'''
+
+
+@unittest.skipUnless(importlib.util.find_spec("PyQt5") and FFMPEG and FFPROBE, "PyQt5 and FFmpeg required")
+class IntakeUiTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix="dolby-intake-")
+        cls.fixture = Path(cls.temp.name).resolve()
+        def command(*args):
+            result = subprocess.run([str(x) for x in args], capture_output=True, text=True,
+                                    encoding="utf-8", errors="replace", timeout=30)
+            if result.returncode:
+                raise AssertionError(result.stderr[-3000:])
+        command(FFMPEG, "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=192x128:rate=12:duration=0.5",
+                "-f", "lavfi", "-i", "sine=frequency=440:sample_rate=48000:duration=0.5",
+                "-c:v", "libx264", "-pix_fmt", "yuv420p", "-c:a", "aac", "-shortest", cls.fixture / "whole original.mp4")
+        command(FFMPEG, "-v", "error", "-i", cls.fixture / "whole original.mp4", "-map", "0:v:0", "-c", "copy",
+                "-an", cls.fixture / "video only.mp4")
+        shutil.copy2(cls.fixture / "video only.mp4", cls.fixture / "second video.mp4")
+        command(FFMPEG, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=880:sample_rate=48000:duration=0.5",
+                cls.fixture / "replacement.wav")
+        command(FFMPEG, "-v", "error", "-i", cls.fixture / "replacement.wav", "-c:a", "aac", "-vn",
+                cls.fixture / "audio inside.mp4")
+        command(FFMPEG, "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=192x128:rate=6:duration=1",
+                "-c:v", "ffv1", "-level", "3", "-pix_fmt", "yuv420p10le", "-color_primaries", "bt709",
+                "-color_trc", "bt709", "-colorspace", "bt709", cls.fixture / "lossless FFV1.mkv")
+        command(FFMPEG, "-v", "error", "-f", "lavfi", "-i", "testsrc2=size=192x128:rate=6:duration=1",
+                "-frames:v", "6", "-c:v", "libx264", "-bf", "0", "-pix_fmt", "yuv420p", "-color_primaries", "bt709",
+                "-color_trc", "bt709", "-colorspace", "bt709", "-f", "mpegts", cls.fixture / "broadcast H264.ts")
+        (cls.fixture / "broken.mp4").write_text("not a video", encoding="utf-8")
+        (cls.fixture / "broken.wav").write_text("not an audio stream", encoding="utf-8")
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def scenario(self, name):
+        result = subprocess.run([sys.executable, "-c", CHILD, str(self.fixture), name], cwd=ROOT,
+                                env=dict(os.environ, QT_QPA_PLATFORM="offscreen", PYTHONUTF8="1"),
+                                capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=25)
+        self.assertEqual(result.returncode, 0, result.stderr[-6000:] + result.stdout[-2000:])
+        self.assertIn("INTAKE_UI_OK:" + name, result.stdout)
+
+    def test_whole_clip_drop_keeps_original_audio_and_prepares_output(self):
+        self.scenario("whole")
+
+    def test_same_drop_routes_separate_video_and_audio_independent_of_order(self):
+        self.scenario("pair")
+
+    def test_audio_dropped_first_survives_later_video_intake(self):
+        self.scenario("audio_first")
+
+    def test_mp4_with_only_audio_is_classified_by_streams(self):
+        self.scenario("audio_container")
+
+    def test_audio_section_replacement_and_restore_original_button(self):
+        self.scenario("restore")
+
+    def test_audio_section_can_extract_audio_from_a_video_container(self):
+        self.scenario("audio_from_video")
+
+    def test_multiple_video_drop_explains_rejection_and_keeps_source(self):
+        self.scenario("multiple_video")
+
+    def test_invalid_single_or_paired_drop_is_atomic(self):
+        self.scenario("invalid_atomic")
+
+    def test_auto_output_updates_but_keyboard_selected_output_is_preserved(self):
+        self.scenario("output")
+
+    def test_real_inspection_does_not_block_gui_event_loop(self):
+        self.scenario("async")
+
+    def test_running_worker_locks_drag_intake_and_unlocks_after_stop(self):
+        self.scenario("processing")
+
+    def test_paired_drop_can_finish_export_without_manual_codec_adjustment(self):
+        self.scenario("export")
+
+    def test_lossless_mkv_drop_automatically_finishes_compatible_native_export(self):
+        self.scenario("native_compatibility")
+
+    def test_h264_transport_stream_drop_automatically_finishes_compatible_native_export(self):
+        self.scenario("transport_compatibility")
+
+    def test_actual_startup_is_maximized_and_normal_window_controls_remain_available(self):
+        self.scenario("maximized")
+
+    def test_audio_controls_explain_atmos_loss_and_preserve_restored_choices(self):
+        self.scenario("atmos_modes")
+        self.scenario("truehd_notice")
+
+
+if __name__ == "__main__":
+    unittest.main()

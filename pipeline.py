@@ -20,7 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent
 TOOLS_DIR = BASE_DIR / "tools"
 WORKSPACE = BASE_DIR / "workspace"
 CHECKPOINT_FILE = WORKSPACE / "checkpoint.json"
-VERSION = "2.1"
+VERSION = "2.2"
 
 
 class PipelineError(RuntimeError):
