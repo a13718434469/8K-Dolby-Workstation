@@ -849,14 +849,15 @@ class MainWindow(QMainWindow):
                 if old_video and different and audio is None:
                     self.ainfo = None
                     self.audio.set_file("")
-                self.video.set_file(video["path"])
+                if different:
+                    self.video.set_file(video["path"])
                 self.probe_timer.stop()
             if audio:
                 self.ainfo = audio["info"]
                 self._audio_mode_explicit = False
                 self.audio.set_file(audio["path"])
             if video:
-                self.on_probe(video["path"], video["info"], "")
+                self.on_probe(self.video.filepath, video["info"], "")
             self.set_compatible_audio()
             self.update_audio_hint()
         finally:
@@ -1219,6 +1220,7 @@ class MainWindow(QMainWindow):
     def on_probe(self, path, info, error):
         if path != self.video.filepath:
             return
+        first_probe = self.vinfo is None
         self.vinfo = info
         if not info:
             self.info_label.setText(f"无法读取素材：{error}")
@@ -1241,7 +1243,9 @@ class MainWindow(QMainWindow):
         self.source_audio[1].setText(f"{audio}\n{atmos}")
         self.drop_title.setText(info.get("filename") or Path(path).name)
         self.drop_hint.setText("可直接开始处理，也可以继续拖入音频替换原音。")
-        if not self.restore_in_progress and self.worker is None and not self._preserve_restored_settings:
+        # Rechecking the current source refreshes its media information without
+        # replacing picture options the user has already adjusted.
+        if first_probe and not self.restore_in_progress and self.worker is None and not self._preserve_restored_settings:
             self.choose_source_preset()
             if self._preset_explicit:
                 self.apply_preset()
@@ -1378,7 +1382,7 @@ class MainWindow(QMainWindow):
             if not self.select_data(self.resolution, size):
                 self.resolution.addItem(f"原任务 · {size[0]} × {size[1]}", size)
                 self.resolution.setCurrentIndex(self.resolution.count() - 1)
-            rate = cfg.get("fps_override", cfg.get("target_fps", 0) if cfg.get("interp") else 0)
+            rate = cfg.get("fps_override", cfg.get("target_fps", 0) if route == "enhance" else 0)
             if not self.select_data(self.fps, rate):
                 self.fps.addItem(f"原任务 · {rate} fps", rate)
                 self.fps.setCurrentIndex(self.fps.count() - 1)

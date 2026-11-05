@@ -229,6 +229,109 @@ def automatic_and_user_output(w):
     assert w.output.text() == custom, 'a new source overwrote the user-selected output path'
 
 
+def choose_combo_with_keys(combo, value):
+    def matches(actual):
+        if isinstance(value, (tuple, list)):
+            return isinstance(actual, (tuple, list)) and tuple(actual) == tuple(value)
+        return actual == value
+    index = next((i for i in range(combo.count()) if matches(combo.itemData(i))), -1)
+    assert index >= 0, 'requested setting is unavailable: ' + str(value)
+    assert combo.isEnabled(), 'manual setting is unexpectedly disabled'
+    combo.setFocus()
+    QTest.keyClick(combo, Qt.Key_Home)
+    for _ in range(index):
+        QTest.keyClick(combo, Qt.Key_Down)
+    QApplication.processEvents()
+    assert matches(combo.currentData()), 'manual setting did not receive user key events'
+
+
+def picture_settings(w):
+    cfg = w.config()
+    keys = ('route', 'width', 'height', 'target_fps', 'color_mode', 'ai', 'interp',
+            'model', 'preset', 'crf', 'batch_size')
+    return {key: cfg[key] for key in keys} | {
+        'fps_override': cfg.get('fps_override'),
+        'preset_choice': w.export_preset.currentData(),
+        'ai_checked': w.ai.isChecked(), 'interp_checked': w.interp.isChecked(),
+    }
+
+
+def toggle_checkbox_with_space(checkbox):
+    assert checkbox.isVisible() and checkbox.isEnabled(), 'checkbox is not available to the user'
+    before = checkbox.isChecked()
+    checkbox.setFocus()
+    # A stretched QCheckBox may have its center outside the indicator/text hit
+    # area on another desktop font. Space activates the focused real control.
+    QTest.keyClick(checkbox, Qt.Key_Space)
+    QApplication.processEvents()
+    assert checkbox.isChecked() != before, 'focused checkbox ignored the user Space key'
+
+
+def same_source_keeps_manual_picture_settings(w):
+    w.load_whole()
+    QTest.mouseClick(w.advanced_toggle, Qt.LeftButton)
+    QApplication.processEvents()
+    # Only tool availability is controlled. The drops below still inspect real
+    # files asynchronously, and no model or AI processing is invoked.
+    w.sr_available = w.interp_available = True
+    for preset in ('quality', 'enhance'):
+        choose_combo_with_keys(w.export_preset, preset)
+        if preset == 'enhance':
+            assert w.ai.isChecked() and w.interp.isChecked(), 'enhance preset did not enable the available tools'
+            toggle_checkbox_with_space(w.ai)
+            toggle_checkbox_with_space(w.interp)
+            assert not w.ai.isChecked() and not w.interp.isChecked(), 'manual enhancement selections did not turn off'
+        choose_combo_with_keys(w.resolution, (1920, 1080))
+        choose_combo_with_keys(w.fps, 24)
+        choose_combo_with_keys(w.color, 'hlg')
+        expected = picture_settings(w)
+        assert expected['width'] == 1920 and expected['target_fps'] == 24
+        assert expected['color_mode'] == 'hlg' and not expected['ai'] and not expected['interp']
+        ok, detail = w.drop([fixture / 'whole original.mp4'])
+        assert ok, detail
+        assert picture_settings(w) == expected, 'same-video reimport reset manual picture settings for ' + preset
+        ok, detail = w.drop([fixture / 'replacement.wav', fixture / 'whole original.mp4'])
+        assert ok, detail
+        assert w.audio.filepath == str(fixture / 'replacement.wav')
+        assert w.audio_mode.currentData() == 'aac', 'new WAV soundtrack was not made MP4-compatible'
+        assert picture_settings(w) == expected, 'same-video plus replacement audio reset manual picture settings for ' + preset
+
+
+def restored_picture_survives_inspection(w):
+    w.load_whole()
+    w.sr_available = w.interp_available = True
+    QTest.mouseClick(w.advanced_toggle, Qt.LeftButton)
+    choose_combo_with_keys(w.export_preset, 'enhance')
+    assert w.ai.isChecked() and w.interp.isChecked(), 'enhance preset did not enable the available tools'
+    toggle_checkbox_with_space(w.interp)
+    for combo, value in ((w.resolution, (1920, 1080)), (w.fps, 48),
+                         (w.color, 'hlg'), (w.audio_mode, 'aac'),
+                         (w.model, 'realesr-animevideov3'), (w.encoding_preset, 'fast')):
+        choose_combo_with_keys(combo, value)
+    for spinbox, value in ((w.crf, '21'), (w.batch_size, '8')):
+        spinbox.setFocus()
+        QTest.keyClick(spinbox, Qt.Key_A, Qt.ControlModifier)
+        QTest.keyClicks(spinbox, value)
+    QApplication.processEvents()
+    # Save a configuration actually produced by the UI, including a manual
+    # frame-rate choice with interpolation disabled, then restore it afresh.
+    saved = dict(w.config())
+    expected = picture_settings(w)
+    w.video.set_file('')
+    w.restore_config(saved)
+    assert picture_settings(w) == expected, 'restoring a task discarded manually chosen picture settings'
+    assert expected['route'] == 'enhance' and expected['width'] == 1920
+    assert expected['target_fps'] == 48, 'restoring a task discarded its requested frame rate'
+    assert expected['color_mode'] == 'hlg' and expected['ai'] and not expected['interp']
+    QTest.qWait(450)
+    spin_until(lambda: not w.probes and not w.probe_timer.isActive(), 'restored picture source inspection')
+    assert picture_settings(w) == expected, 'late inspection reset restored picture settings'
+    assert w.audio_mode.currentData() == 'aac'
+    ok, detail = w.drop([fixture / 'whole original.mp4'])
+    assert ok, detail
+    assert picture_settings(w) == expected, 'same-video reimport reset a restored task'
+
+
 def asynchronous_validation(w):
     import quality
     original = quality.inspect_media
@@ -456,6 +559,8 @@ scenarios = {
     'atmos_modes': atmos_mode_notice, 'truehd_notice': truehd_conversion_notice,
     'native_compatibility': unsupported_copy_gets_native_export,
     'transport_compatibility': transport_stream_gets_native_export,
+    'same_source_settings': same_source_keeps_manual_picture_settings,
+    'restored_picture': restored_picture_survives_inspection,
 }
 main.MainWindow = IntakeWindow
 result = main.main()
@@ -530,6 +635,12 @@ class IntakeUiTests(unittest.TestCase):
 
     def test_auto_output_updates_but_keyboard_selected_output_is_preserved(self):
         self.scenario("output")
+
+    def test_same_video_or_video_with_new_audio_keeps_manual_picture_settings(self):
+        self.scenario("same_source_settings")
+
+    def test_restored_picture_parameters_survive_async_inspection_and_reimport(self):
+        self.scenario("restored_picture")
 
     def test_real_inspection_does_not_block_gui_event_loop(self):
         self.scenario("async")
