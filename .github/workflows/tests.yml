@@ -1,0 +1,79 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regression:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.10', '3.12']
+    env:
+      PYTHONUTF8: '1'
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - name: Install FFmpeg (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+      - name: Install FFmpeg (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install ffmpeg --yes --no-progress
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Require real media tools
+        run: |
+          ffmpeg -hide_banner -version
+          ffprobe -hide_banner -version
+      - name: Check Python syntax
+        run: python -m compileall -q main.py pipeline.py quality.py cli.py tests
+      - name: Run regression suite
+        run: python -m unittest discover -s tests -v
+
+  native-dolby:
+    name: Native Dolby Vision / Windows / Python 3.12
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      PYTHONUTF8: '1'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install official FFmpeg and dovi_tool
+        shell: pwsh
+        run: |
+          powershell.exe -NoProfile -ExecutionPolicy Bypass -File ./setup.ps1 -CoreOnly -WithDovi -SkipPython
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          (Join-Path $PWD 'tools') | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Require native Dolby support before testing
+        run: |
+          ffmpeg -hide_banner -version
+          dovi_tool --version
+          python -c "import sys; sys.path.insert(0, 'tests'); import test_delivery, test_pipeline; assert test_delivery.HAS_DOVI, 'Dolby delivery tests would be skipped'; assert test_pipeline.HAS_NATIVE_DOVI, 'Native RPU tests would be skipped'"
+      - name: Test native delivery and preservation
+        run: python -m unittest discover -s tests -p test_delivery.py -v
+      - name: Test RPU compatibility rejection
+        run: python -m unittest discover -s tests -p test_rpu_compat.py -v
+      - name: Test processing and native Profile 8.1 roundtrip
+        run: python -m unittest discover -s tests -p test_pipeline.py -v
+      # Atmos fixture tests remain opt-in locally. CI never downloads media,
+      # uploads generated clips, or caches third-party binary tool bundles.

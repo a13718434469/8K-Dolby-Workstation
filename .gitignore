@@ -1,0 +1,41 @@
+# Local environments, caches and editor files
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+htmlcov/
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
+
+# Downloaded tools/models retain their own upstream licenses.
+tools/*
+!tools/.gitkeep
+.setup-*/
+
+# Generated media and resumable job artifacts
+workspace/
+*.partial.mp4
+*.partial.hevc
+*.log
+*.quality.json
+*.mp4
+*.mov
+*.m4v
+*.mkv
+*.hevc
+*.h265
+*.eac3
+*.ac3
+*.aac
+*.m4a
+*.wav
+*.bin
+.env
+.env.*
+.playwright/
+.playwright-cli/
+browser-profile/
