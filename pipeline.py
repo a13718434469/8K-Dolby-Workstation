@@ -20,7 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent
 TOOLS_DIR = BASE_DIR / "tools"
 WORKSPACE = BASE_DIR / "workspace"
 CHECKPOINT_FILE = WORKSPACE / "checkpoint.json"
-VERSION = "3.1"
+VERSION = "3.2"
 
 
 class PipelineError(RuntimeError):
@@ -1251,7 +1251,7 @@ class Pipeline:
                 report["export"]["rpu_validation"] = self.manifest["rpu_validation"]
             if self.cfg["bili_one_click"] and self.cfg.get("picture_plan"):
                 report["export"]["picture_plan"] = self.cfg["picture_plan"]
-            for key in ("hdr_remaster", "dolby_analysis", "rpu_final_validation", "atmos_audio", "free_audio", "ai_denoise", "music_sr", "consumer_audio"):
+            for key in ("hdr_remaster", "dolby_analysis", "rpu_final_validation", "atmos_audio", "free_audio", "ai_denoise", "music_sr", "consumer_audio", "video_super_resolution"):
                 if key == "atmos_audio" and self.cfg["bili_one_click"] and not self.companion_audio:
                     continue
                 if self.manifest.get(key):
@@ -1325,7 +1325,7 @@ class Pipeline:
             raise PipelineError("视频码流校验不一致，未发布输出")
         return data
 
-    def _native_filters(self):
+    def _native_filters(self, *, sr_rgb=False):
         """Keep native precision until the final 10-bit quantization."""
         stream, mode = self.info["stream"], self.cfg["color_mode"]
         transfer = stream.get("color_transfer") if self.cfg["source_transfer_override"] == "auto" else self.cfg["source_transfer_override"]
@@ -1340,6 +1340,9 @@ class Pipeline:
         if stream.get("pix_fmt", "").startswith(("rgb", "bgr", "gbr")):
             matrix = "gbr"
         value_range = "full" if stream.get("color_range") == "pc" or matrix == "gbr" else "limited"
+        if sr_rgb:
+            # The model receives full-range sRGB from the decoded SDR programme.
+            transfer, primaries, matrix, value_range = "iec61966-2-1", "bt709", "gbr", "full"
         out_t = "arib-std-b67" if mode in ("hlg", "dv84") else ("smpte2084" if mode in ("hdr10", "dv81") else "bt709")
         out_p = "bt709" if mode == "sdr" else "bt2020"
         out_m = "bt709" if mode == "sdr" else "bt2020nc"
@@ -1349,6 +1352,9 @@ class Pipeline:
         if cfg.get("bili_one_click"):
             from consumer_picture import cadence_filter
             cadence = cadence_filter(cfg.get("picture_plan", {}), self.rate, self.info["duration"])
+        if sr_rgb:
+            cadence = ""  # Input PNGs already carry the complete target cadence.
+            filters += "format=gbrp,"
         plan = cfg.get("picture_plan", {}) if cfg.get("bili_one_click") else {}
         # Upscale after interpolation and HDR conversion. Motion estimation runs
         # on actual source pixels; the final resize operates on the 10-bit frame.
@@ -1417,21 +1423,35 @@ class Pipeline:
             transfer = "arib-std-b67" if mode in ("hlg", "dv84") else ("smpte2084" if mode in ("hdr10", "dv81") else "bt709")
             primaries, matrix = ("bt709", "bt709") if mode == "sdr" else ("bt2020", "bt2020nc")
             params = f"repeat-headers=1:frame-threads=1:bframes=0:colorprim={primaries}:transfer={transfer}:colormatrix={matrix}"
-            cmd = [find_tool("ffmpeg"), "-nostdin", "-v", "warning", "-y", "-i", self.cfg["video"],
-                   "-map", f"0:{self.info['stream']['index']}", "-vf", self._native_filters(),
-                   "-c:v", "libx265", "-preset", self.cfg.get("preset", "medium"), "-crf", str(self.cfg.get("crf", 18)),
+            opts = ["-c:v", "libx265", "-preset", self.cfg.get("preset", "medium"), "-crf", str(self.cfg.get("crf", 18)),
                    "-pix_fmt", "yuv420p10le", "-x265-params", params,
                    "-tag:v", "hvc1", "-video_track_timescale", str(self.rate.numerator), "-an", partial]
             if any(s.get("side_data_type") == "DOVI configuration record" for s in self.info["stream"].get("side_data_list", [])):
                 help_text = self._run([find_tool("ffmpeg"), "-hide_banner", "-h", "encoder=libx265"])
                 if "-dolbyvision" in help_text:
-                    cmd[-1:-1] = ["-dolbyvision", "0"]
-            self._run(cmd, cwd=self.job_dir)
+                    opts[-1:-1] = ["-dolbyvision", "0"]
+            sr_report = {}
+            if self.cfg.get("bili_one_click") and self.cfg.get("picture_plan", {}).get("sr_method") == "realesrgan_x4plus":
+                from video_sr import render, InferenceUnavailable
+                self.stage("1/6 Real-ESRGAN 画面超分与编码", 1, 6)
+                try:
+                    sr_report = render(self, find_tool("ffmpeg"), TOOLS_DIR, opts)
+                except InferenceUnavailable as exc:
+                    self._boundary()
+                    sr_report = {"applied": False, "detail": f"{exc}，本次使用高精度缩放"}
+                self.manifest["video_super_resolution"] = sr_report
+                self.log("[画面] " + sr_report["detail"])
+            if not sr_report.get("applied"):
+                cmd = [find_tool("ffmpeg"), "-nostdin", "-v", "warning", "-y", "-i", self.cfg["video"],
+                       "-map", f"0:{self.info['stream']['index']}", "-vf", self._native_filters(), *opts]
+                self._run(cmd, cwd=self.job_dir)
             expected = None
             if self.cfg.get("bili_one_click") and self.cfg.get("picture_plan", {}).get("method") == "motion_interpolation":
                 expected = max(1, round(Fraction(str(self.info["duration"])) * self.rate))
             data = self._validate_video(partial, count=expected)
             video = next(s for s in data["streams"] if s["codec_type"] == "video")
+            if sr_report.get("applied") and int(video["nb_read_frames"]) != sr_report["encoded_frames"]:
+                raise PipelineError("AI 超分后的编码帧数与已处理的帧数不一致")
             self.manifest["output_frames"] = int(video["nb_read_frames"])
             self.manifest["duration"] = self.manifest["output_frames"] / float(self.rate)
             self.manifest["fps"] = str(self.rate)

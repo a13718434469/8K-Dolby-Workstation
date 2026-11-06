@@ -28,6 +28,12 @@ on the 4095 grid. Raw measurements and CM4-clamped values are both retained.
 No proprietary temporal smoothing, active-area detection or artistic trims are
 claimed. Bilinear reconstruction is a declared interpolation choice.
 
+The automatic authoring path stores full-resolution per-frame measurements.
+It detects cuts and writes one set of Level 1 values per detected shot,
+verifying the scene refresh flags after extraction. Earlier exports used a
+separate shot on every frame. Shot detection and aggregation are independent
+implementations. Playback on the target display determines the visual result.
+
 Pixel analysis is streaming: Python holds one decoded frame and bounded NumPy
 tiles, rather than all frames' RGB pixels. This is not an end-to-end constant
 memory guarantee. dovi_tool reads the complete generator configuration and can

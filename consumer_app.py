@@ -104,7 +104,9 @@ class ExportThread(QThread):
                 self.plan_text.emit(plan["detail"] + "。\n" + sound)
                 self.stage_text.emit(f"{Path(video).name}　·　{cfg['width']} × {cfg['height']}　·　{plan['output_fps']} fps")
                 def stage(name, *_):
-                    if plan["method"] == "motion_interpolation" and name.startswith("1/"):
+                    if plan.get("sr_method") == "realesrgan_x4plus" and "Real-ESRGAN" in name:
+                        self.stage_text.emit("正在用 Real-ESRGAN 做 AI 画面超分并编码")
+                    elif plan["method"] == "motion_interpolation" and name.startswith("1/"):
                         self.stage_text.emit(f"正在生成中间帧并编码画面　·　目标 {plan['output_fps']} fps")
                     else:
                         self.stage_text.emit(name.split(" ", 1)[-1])
@@ -133,6 +135,9 @@ def result_lines(report):
         sw, sh = plan["source_size"]
         picture += f"（由 {sw} × {sh} 放大）"
     lines = [picture]
+    enhancement = report.get("export", {}).get("video_super_resolution") or {}
+    if enhancement.get("detail"):
+        lines.append(enhancement["detail"])
     if audio.get("atmos"):
         lines.append("杜比全景声　·　已校验 Atmos 音轨")
     else:

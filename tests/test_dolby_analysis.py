@@ -192,7 +192,35 @@ class ActualComposerTests(unittest.TestCase):
         with self.assertRaises(analysis.AnalysisError):
             analysis.verify_rpu(DOVI, result["rpu_path"], changed)
         cfg = json.loads(Path(result["config_path"]).read_text())
-        self.assertEqual([s["duration"] for s in cfg["shots"]], [1] * 6)
+        self.assertEqual([s["duration"] for s in cfg["shots"]], [3, 3])
+        self.assertEqual(report["shot_starts"], [0, 3])
+        self.assertTrue(verified["scene_refresh_flags_verified"])
+        with self.assertRaisesRegex(analysis.AnalysisError, "scene refresh"):
+            analysis.verify_rpu(DOVI, result["rpu_path"], dict(report, shot_starts=[0, 2, 3]))
+
+    def test_short_flash_not_an_edit_and_interpolated_peaks_stay_stable(self):
+        detector = analysis.ShotDetector()
+        for v in [128, 128, 800, 128, 128, 128, 700, 700, 700, 700]:
+            y = np.full((48, 64), v, dtype=np.uint16)
+            chroma = np.full((24, 32), 512, dtype=np.uint16)
+            detector.push(detector.sketch(y, chroma, chroma))
+        self.assertEqual(detector.finish(), [0, 6])
+        with tempfile.TemporaryDirectory(dir=self.work) as folder:
+            root = Path(folder)
+            raw, cfg, ledger = (root / name for name in ("raw", "config.json", "frames.jsonl"))
+            samples = [(0., p, a) for p, a in zip([.89,.70,.88,.70,.89,.70,.63,.60,.63,.59],
+                                                   [.35]*6 + [.25]*4)]
+            raw.write_text("".join(json.dumps({"frame": i, "measured_pq": dict(zip(
+                ("min_pq","max_pq","avg_pq"), values))}) + "\n" for i, values in enumerate(samples)), encoding="utf-8")
+            temporal = analysis.write_shot_config(raw, detector.finish(), len(samples), cfg, ledger)
+            shots = json.loads(cfg.read_text(encoding="utf-8"))["shots"]
+            levels = [shot["metadata_blocks"][0]["Level1"] for shot in shots]
+            self.assertEqual([level["max_pq"] for level in levels],
+                             [analysis.quantize_pq(.89), analysis.quantize_pq(.63)])
+            self.assertEqual(temporal["encoded_l1_changes"], 1)
+            records = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([r["frame"] for r in records if r["scene_refresh"]], [0,6])
+            self.assertEqual([r["encoded_l1"] for r in records], [levels[0]]*6 + [levels[1]]*4)
 
     def test_cancel_callback_exception_terminates_and_removes_partial_job(self):
         work = self.work / "cancelled"

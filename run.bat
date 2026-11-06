@@ -5,12 +5,12 @@ title 8K Dolby Workstation
 pushd "%~dp0"
 if errorlevel 1 exit /b 1
 if not exist "%~dp0.venv\Scripts\python.exe" goto bootstrap
-"%~dp0.venv\Scripts\python.exe" -c "from PyQt5 import QtWidgets; import numpy; from pipeline import find_tool; [find_tool(t) for t in ('ffmpeg','ffprobe','dovi_tool')]" >nul 2>&1
+"%~dp0.venv\Scripts\python.exe" -c "from PyQt5 import QtWidgets; import numpy; from pipeline import find_tool,TOOLS_DIR; [find_tool(t) for t in ('ffmpeg','ffprobe','dovi_tool','realesrgan-ncnn-vulkan')]; assert (TOOLS_DIR/'models'/'realesrgan-x4plus.bin').is_file()" >nul 2>&1
 if errorlevel 1 goto bootstrap
 goto launch
 
 :bootstrap
-echo Preparing Python, FFmpeg and Dolby metadata tools. AI tools can be installed with setup.bat.
+echo Preparing the workspace, video tools and official image enhancement model.
 call "%~dp0setup.bat" -CoreOnly
 if errorlevel 1 goto failed
 

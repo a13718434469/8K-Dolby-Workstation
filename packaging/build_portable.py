@@ -26,11 +26,20 @@ EMBED_SHA = "4acbed6dd1c744b0376e3b1cf57ce906f9dc9e95e68824584c8099a63025a3c3"
 DOVI_LICENSE = "https://raw.githubusercontent.com/quietvoid/dovi_tool/2.3.4/LICENSE"
 DOVI_SHA = "8cd1262b4edac2df219448d3450ff8e810c775e8025cdbe5e031d8f5efd55db8"
 MODEL_SHA = "e255c76b227f16f7f392cc43677c38bd2c5aa129f042a2ba3eb03fb29e470c7a"
+ESRGAN_RELEASE = "https://github.com/xinntao/Real-ESRGAN/releases/tag/v0.2.5.0"
+ESRGAN_FILES = {
+    "realesrgan-ncnn-vulkan.exe": {"07e49f7cbb4ede01ae4dd4c399d3a7e5846e3d2085c3128eff881e55cb7b1a0c"},
+    "models/realesrgan-x4plus.bin": {"713ee713b0353afaa27976f0563a64a5043bd70b9bd8936c2e26e25ebcdbcddf"},
+    "models/realesrgan-x4plus.param": {"35330ececcea33b6c397a72548e788d5d53becee4734c50b7fada36e89f10a86"},
+    # Both supported upstream Windows bundles ship the Microsoft OpenMP runtime.
+    "vcomp140.dll": {"8f72ef2e483465444b2059fc6744d6cb22cd8d8a27f6fa56befd2a42dcd0f78b",
+                     "54fe6b087528b33c2969143d811eb62f1bd49071d37de9db0745fc079764d698"},
+}
 APP_FILES = (
     "consumer_app.py", "consumer_audio.py", "consumer_picture.py", "pipeline.py", "quality.py", "app_identity.py", "cli.py", "dolby_analysis.py",
     "hdr_remaster.py", "hires_audio.py", "atmos_cloud.py", "atmos_encoding.py", "flashsr_official.py",
     "ai_audio.py", "install_audio_model.py", "music_sr.py", "music_sr_backend.py", "dolby_opencl.py",
-    "assets/app.svg", "LICENSE", "README.md", "DOLBY_ANALYSIS_NOTICE.md", "NOVASR_NOTICE.txt", "FLASHSR_NOTICE.txt",
+    "video_sr.py", "assets/app.svg", "LICENSE", "README.md", "DOLBY_ANALYSIS_NOTICE.md", "NOVASR_NOTICE.txt", "FLASHSR_NOTICE.txt", "REAL_ESRGAN_NOTICE.txt",
     "main.py", "ATMOS_SETUP.md", "requirements.txt", "run.bat", "setup.bat", "setup.ps1",
 )
 PACKAGES = (
@@ -175,6 +184,19 @@ def install_app(out, icon, extra):
     if sha(model) != MODEL_SHA:
         raise RuntimeError("Official FlashSR ONNX weights failed verification")
     copy(model, app / "tools" / "flashsr" / "model.onnx")
+    images = {}
+    for name, allowed in ESRGAN_FILES.items():
+        src = ROOT / "tools" / name
+        digest = sha(src)
+        if digest not in allowed:
+            raise RuntimeError(f"Real-ESRGAN distribution file failed verification: {name}")
+        copy(src, app / "tools" / name)
+        images[name] = digest
+    sources_file = out / "licenses" / "sources.json"
+    sources = json.loads(sources_file.read_text(encoding="utf-8"))
+    sources["Real-ESRGAN"] = {"release": ESRGAN_RELEASE, "model": "realesrgan-x4plus", "files": images}
+    sources_file.write_text(json.dumps(sources, ensure_ascii=False, indent=2), encoding="utf-8")
+    copy(ROOT / "REAL_ESRGAN_NOTICE.txt", out / "licenses" / "Real-ESRGAN.txt")
     copy(HERE / "portable_start.py", app / "portable_start.py")
     for name in ("Launcher.cs", "portable_start.py", "build_portable.py", "windows-requirements.txt", "BUILD.md"):
         copy(HERE / name, app / "packaging" / name)

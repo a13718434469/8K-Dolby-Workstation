@@ -32,7 +32,8 @@ function Get-ToolDefinitions {
             Files = @('ffmpeg.exe', 'ffprobe.exe')
         },
         @{
-            Name = 'Real-ESRGAN'; Exe = 'realesrgan-ncnn-vulkan.exe'; Core = $false
+            Name = 'Real-ESRGAN'; Exe = 'realesrgan-ncnn-vulkan.exe'; Core = $true
+            Sha256 = 'abc02804e17982a3be33675e4d471e91ea374e65b70167abc09e31acb412802d'
             Url = 'https://github.com/xinntao/Real-ESRGAN/releases/download/v0.2.5.0/realesrgan-ncnn-vulkan-20220424-windows.zip'
             Files = @('realesrgan-ncnn-vulkan.exe', 'models/realesrgan-x4plus.bin', 'models/realesrgan-x4plus.param',
                 'models/realesrgan-x4plus-anime.bin', 'models/realesrgan-x4plus-anime.param',
@@ -62,6 +63,9 @@ function Install-ToolBundle {
     $archive = Join-Path $stage 'bundle.zip'
     Write-Host ("Downloading {0} from its official release..." -f $Definition.Name)
     Invoke-WebRequest -Uri $Definition.Url -OutFile $archive -UseBasicParsing -TimeoutSec 1200
+    if ($Definition.ContainsKey('Sha256') -and (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash -ne $Definition.Sha256) {
+        throw "Unexpected $($Definition.Name) archive checksum; retry the download."
+    }
     if ($Definition.ContainsKey('ChecksumUrl')) {
         $checksums = Join-Path $stage 'checksums.sha256'
         Invoke-WebRequest -Uri $Definition.ChecksumUrl -OutFile $checksums -UseBasicParsing -TimeoutSec 120

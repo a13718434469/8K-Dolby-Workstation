@@ -99,11 +99,16 @@ def plan_picture(source):
             detail += f"，居中补黑边至 {w}×{h}"
         if source.get("dv_profile"):
             detail += "，按新画面重新生成杜比元数据"
+    neural = (upscale and motion_input and not hdr and min(width, height) >= 32
+              and max(width, height) <= 1920 and min(width, height) <= 1080)
+    sr = ("尝试使用 Real-ESRGAN 通用模型做 4 倍画面超分，再适配成片尺寸" if neural else
+          "沿用高精度缩放，保留源信号精度" if resized else "保留原画面尺寸")
     plan = {"method": method, "source_fps": str(rate), "output_fps": str(target),
             "source_size": [width, height], "output_size": [w, h],
             "active_size": list(active),
             "resize": "upscale" if upscale else "fit" if resized else "native",
-            "detail": error or detail}
+            "sr_method": "realesrgan_x4plus" if neural else "native",
+            "sr_detail": sr, "detail": error or (detail + "；" + sr)}
     if error:
         plan["error"] = error
     cfg = {"route": route, "delivery": "bilibili", "color_mode": "dv84", "rpu_mode": "auto",
