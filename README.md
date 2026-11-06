@@ -1,4 +1,4 @@
-# 8K Dolby Workstation 2.5
+# 8K Dolby Workstation 2.6
 
 用于视频检查、原片保留、高精度转码和可选 AI 增强的本地工作站。桌面与命令行共用处理核心，输出经过解码和格式检查后才保存为正式文件。
 
@@ -27,6 +27,10 @@
 原片保留不会为了凑成 8K / 120fps 而重新编码。重新编码不保证与源文件完全一致，AI 超分和插帧也可能引入伪影。建议先检查短片，再处理长片。
 
 ### 免费制作与 Hi-Res 投稿
+
+**有底噪的对白**可以在免费方案里勾选“AI 人声降噪”。工作站会在本机运行 RNNoise 模型，压低人声之间的风扇声等背景噪声。适用于普通有损单声道和立体声录音。它会保留部分原声，处理结果按源采样率保存为 16-bit ALAC。适合保留音乐、环境气氛或原有混音时，让该选项保持关闭。无损母版、Atmos 和多声道素材沿用原音轨处理方案。
+
+首次使用 AI 降噪可运行 `setup.bat -CoreOnly -WithAudioAI`。已有环境只需运行 `.\.venv\Scripts\python.exe install_audio_model.py` 安装约 298 KB 的模型；`--verify-only` 可离线校验模型。命令行在 `--auto-free` 或 `--audio-mode hires` 后添加 `--ai-denoise`。程序只在安装时从作者的固定版本下载模型并核对 SHA-256，之后可离线处理。参见 [RNNoise 模型来源](https://github.com/GregorR/rnnoise-models/tree/3eee541a283fd3b8f81b85b1748e3b9ccbefa04d/somnolent-hogwash-2018-09-01) 与 [FFmpeg arnndn 滤镜](https://ffmpeg.org/ffmpeg-filters.html#arnndn)。
 
 [B站官方 Hi-Res 投稿须知](https://www.bilibili.com/blackboard/activity-m1vS5T9l2t.html)列出的音频门槛是支持的无损编码、至少 48 kHz、至少 24 bit；其中包含 ALAC、FLAC、PCM。说明将 48 至不足 96 kHz 和 96 kHz 及以上分作两个平台输出档位。Hi-Res 描述声音的采样和保存精度，区别于描述声场的 Dolby Atmos。
 

@@ -20,7 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent
 TOOLS_DIR = BASE_DIR / "tools"
 WORKSPACE = BASE_DIR / "workspace"
 CHECKPOINT_FILE = WORKSPACE / "checkpoint.json"
-VERSION = "2.5"
+VERSION = "2.6"
 
 
 class PipelineError(RuntimeError):
@@ -340,6 +340,8 @@ class Pipeline:
             raise PipelineError("不支持的色彩模式")
         if cfg["audio_mode"] not in ("copy", "aac", "eac3", "none", "atmos_auto", "hires"):
             raise PipelineError("不支持的音频模式")
+        if type(cfg["ai_denoise"]) is not bool or (cfg["ai_denoise"] and cfg["audio_mode"] != "hires"):
+            raise PipelineError("AI 人声降噪仅用于免费本地音频路线")
         if not all(isinstance(cfg[k], int) and 16 <= cfg[k] <= 8192 and cfg[k] % 2 == 0
                    for k in ("width", "height")):
             raise PipelineError("输出宽高必须是 16 到 8192 之间的偶数")
@@ -425,6 +427,11 @@ class Pipeline:
             except HiresAudioError as exc:
                 raise PipelineError(str(exc)) from exc
             self.log("[免费本地] " + self.free_audio["detail"])
+            if cfg["ai_denoise"]:
+                from ai_audio import ai_skip_reason, verify_ai_model
+                from install_audio_model import MODEL_PATH
+                if not ai_skip_reason(self.free_audio):
+                    verify_ai_model(find_tool("ffmpeg"), MODEL_PATH, self._run)
         self.audio_offset = 0.0
         if self.audio_stream and Path(self.audio_source).resolve() == video:
             try:
@@ -492,6 +499,7 @@ class Pipeline:
 
     @staticmethod
     def _dolby_defaults(cfg):
+        cfg.setdefault("ai_denoise", False)
         cfg.setdefault("source_transfer_override", "auto")
         cfg.setdefault("rpu_mode", "external" if cfg.get("rpu") else "auto")
         automatic = cfg.get("route") != "preserve" and cfg.get("color_mode") == "dv84" and cfg["rpu_mode"] == "auto"
@@ -842,6 +850,19 @@ class Pipeline:
             return self._generate_atmos_audio(duration)
         output = self.job_dir / "audio.mp4"
         mode = self.free_audio["action"] if self.free_audio else self.cfg["audio_mode"]
+        if self.cfg["ai_denoise"]:
+            from ai_audio import analyze_ai_audio
+            from install_audio_model import MODEL_PATH
+            if "audio" not in self.manifest["completed"]:
+                self.manifest["ai_denoise"] = analyze_ai_audio(
+                    find_tool("ffmpeg"), self.audio_source, self.free_audio, duration, self.audio_offset,
+                    MODEL_PATH, self._run)
+            decision = self.manifest.get("ai_denoise")
+            if not isinstance(decision, dict) or type(decision.get("applied")) is not bool:
+                raise PipelineError("缺少降噪处理记录，请新建任务")
+            if decision["applied"]:
+                mode = "denoise"
+            self.log("[AI 人声降噪] " + decision["detail"])
         copy_preroll = max(-self.audio_offset, 0) if mode in ("copy", "atmos_auto") else 0.0
         if (copy_preroll and "audio" in self.manifest["completed"]
                 and self.manifest.get("audio_trimmed_preroll_seconds") != copy_preroll):
@@ -869,6 +890,9 @@ class Pipeline:
             elif mode in ("alac", "pcm"):
                 from hires_audio import hires_encode_args
                 cmd += hires_encode_args(self.free_audio, duration, self.audio_offset)
+            elif mode == "denoise":
+                from ai_audio import ai_encode_args
+                cmd += ai_encode_args(self.free_audio, decision, duration, self.audio_offset)
             else:
                 offset = round(self.audio_offset * 48000)
                 align = "aresample=48000,asetpts=PTS-STARTPTS,"
@@ -883,10 +907,13 @@ class Pipeline:
                     self.log("[音频] E-AC-3 编码支持最多 5.1 声道，将下混；此编码不会生成 Atmos 对象元数据")
             # Copy keeps pre-roll packets for MP4 edit-list alignment. Do not
             # truncate the end before the negative start offset is applied.
-            if mode not in ("alac", "pcm"):
+            if mode not in ("alac", "pcm", "denoise"):
                 cmd += ["-t", f"{duration:.9f}"]
             cmd += [partial]
-            self._run(cmd)
+            if mode == "denoise":
+                self._run(cmd, cwd=MODEL_PATH.parent)
+            else:
+                self._run(cmd)
             data = _json_command([find_tool("ffprobe"), "-v", "error", "-show_streams", "-of", "json", str(partial)])
             if not any(s.get("codec_type") == "audio" for s in data.get("streams", [])):
                 raise PipelineError("音轨校验失败")
@@ -1004,6 +1031,7 @@ class Pipeline:
         # The temporary final output stays on the output volume for atomic publication.
         partial = self.output.with_name(f".{self.output.stem}.{self.manifest['job_id']}.partial.mp4")
         cmd = [find_tool("ffmpeg"), "-nostdin", "-v", "warning", "-y"]
+        denoised = bool(self.manifest.get("ai_denoise", {}).get("applied"))
         if self.cfg["route"] != "preserve" and self.cfg["color_mode"] in ("dv81", "dv84"):
             cmd += ["-fflags", "+genpts", "-r", str(self.rate)]
         if self.cfg["route"] == "preserve":
@@ -1018,7 +1046,7 @@ class Pipeline:
         if audio:
             audio_offset = self.audio_offset + self.manifest.get("audio_trimmed_preroll_seconds", 0.0)
             copy_audio = self.free_audio["action"] == "copy" if self.free_audio else self.cfg["audio_mode"] in ("copy", "atmos_auto")
-            if copy_audio and not self._generate_atmos and audio_offset:
+            if copy_audio and not denoised and not self._generate_atmos and audio_offset:
                 # Each separate audio input is normalized by FFmpeg on reading;
                 # restore its original position on the source video's timeline.
                 cmd += ["-itsoffset", f"{audio_offset:.9f}"]
@@ -1033,7 +1061,7 @@ class Pipeline:
         elif self.info["stream"]["codec_name"] == "h264":
             cmd += ["-tag:v", "avc1"]
         cmd += ["-movflags", "+faststart", "-strict", "unofficial", partial]
-        if self.free_audio and self.free_audio["action"] in ("alac", "pcm"):
+        if self.free_audio and (self.free_audio["action"] in ("alac", "pcm") or denoised):
             cmd[-1:-1] = ["-movie_timescale", str(self.free_audio["sample_rate"])]
         if self.cfg["delivery"] == "bilibili":
             cmd[-1:-1] = ["-map_metadata", "-1", "-map_chapters", "-1"]
@@ -1070,6 +1098,14 @@ class Pipeline:
             if self.free_audio:
                 from hires_audio import verify_hires_audio, HiresAudioError
                 free_audio = dict(self.free_audio, retained_atmos=False, platform_verified=False)
+                if denoised:
+                    from ai_audio import verify_ai_audio
+                    decision = self.manifest["ai_denoise"]
+                    checked = verify_ai_audio(find_tool("ffmpeg"), partial, media["audio_streams"][0],
+                                              self.free_audio, decision, expected, self._run)
+                    decision.update(checked)
+                    free_audio.update(action="denoise", output_codec="alac", output_bits=16,
+                                      eligible=False, detail=decision["detail"])
                 if free_audio["action"] in ("alac", "pcm"):
                     try:
                         evidence = verify_hires_audio(find_tool("ffmpeg"), self.audio_source, partial,
@@ -1111,7 +1147,7 @@ class Pipeline:
                                 "decode_verified": True, "source": self.cfg["video"]}
             if self.manifest.get("rpu_validation"):
                 report["export"]["rpu_validation"] = self.manifest["rpu_validation"]
-            for key in ("hdr_remaster", "dolby_analysis", "rpu_final_validation", "atmos_audio", "free_audio"):
+            for key in ("hdr_remaster", "dolby_analysis", "rpu_final_validation", "atmos_audio", "free_audio", "ai_denoise"):
                 if self.manifest.get(key):
                     report["export"][key] = self.manifest[key]
             if self.cfg["delivery"] == "bilibili" and report["status"] == "fail":

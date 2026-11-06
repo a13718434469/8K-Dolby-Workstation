@@ -317,6 +317,37 @@ def free_audio_track_selection(w):
     assert w.export_preset.currentData() == 'bili_hires' and not w.atmos_setup.isVisible()
 
 
+def opt_in_ai_denoise(w):
+    from unittest.mock import patch
+    w.load_whole()
+    assert w.ai_denoise.isVisible() and not w.config()['ai_denoise']
+    toggle_checkbox_with_space(w.ai_denoise)
+    assert w.config()['ai_denoise'] and '减轻对白底噪' in w.audio_hint.text()
+    assert '减轻对白底噪' in w.quality_details.text()
+    with patch('install_audio_model.MODEL_PATH', fixture / 'missing.rnnn'):
+        w.refresh_start_state()
+        assert w.start.text() == '模型安装说明…' and '-WithAudioAI' in w.start.toolTip()
+        with patch.object(QMessageBox, 'information') as show_install:
+            QTest.mouseClick(w.start, Qt.LeftButton)
+            show_install.assert_called_once()
+            assert '-WithAudioAI' in show_install.call_args.args[2] and w.worker is None
+    saved = w.config()
+    w.save_preferences()
+    w.select_data(w.export_preset, 'bili_dual')
+    assert not w.ai_denoise.isVisible() and not w.config()['ai_denoise']
+    w.restore_config(saved)
+    assert w.ai_denoise.isVisible() and w.config()['ai_denoise']
+    del saved['ai_denoise']
+    w.restore_config(saved)
+    assert not w.config()['ai_denoise'], 'legacy jobs must use the original soundtrack'
+    assert w.load_preferences() and w.config()['ai_denoise']
+    ok, detail = w.drop([fixture / 'two tracks.mka'], target=w.audio)
+    assert ok, detail
+    assert 'Hi-Res' in w.audio_hint.text() and '跳过 AI 人声降噪' in w.audio_hint.text()
+    with patch('install_audio_model.MODEL_PATH', fixture / 'missing.rnnn'):
+        assert w.audio_readiness(w.config()) is None
+
+
 def reject_multiple_video(w):
     w.load_whole()
     before = w.state()
@@ -917,6 +948,7 @@ scenarios = {
     'source_transfer': explicit_source_dynamic_range,
     'audio_container': audio_only_container, 'restore': replace_and_restore,
     'audio_from_video': audio_from_video_section, 'free_tracks': free_audio_track_selection,
+    'ai_denoise': opt_in_ai_denoise,
     'multiple_video': reject_multiple_video,
     'invalid_atomic': reject_invalid_atomically, 'output': automatic_and_user_output,
     'async': asynchronous_validation, 'processing': processing_locks_intake,
@@ -1049,6 +1081,9 @@ class IntakeUiTests(unittest.TestCase):
 
     def test_free_preset_previews_selected_hires_track_and_round_trips(self):
         self.scenario("free_tracks")
+
+    def test_ai_denoise_opt_in_preserves_masters_and_legacy_jobs(self):
+        self.scenario("ai_denoise")
 
     def test_multiple_video_drop_explains_rejection_and_keeps_source(self):
         self.scenario("multiple_video")

@@ -3,6 +3,7 @@
 param(
     [switch]$CoreOnly,
     [switch]$WithDovi,
+    [switch]$WithAudioAI,
     [switch]$SkipDownloads,
     [switch]$SkipPython,
     [switch]$VerifyOnly
@@ -176,6 +177,16 @@ function Invoke-WorkstationSetup {
         Write-Host ("Ready: {0}" -f $definition.Name) -ForegroundColor Green
     }
     Test-FFmpegInstallation -ToolsDir $toolsDir -RequireDovi
+    if ($WithAudioAI) {
+        $modelPython = Join-Path $baseDir '.venv/Scripts/python.exe'
+        if (-not (Test-Path -LiteralPath $modelPython)) { $modelPython = (Get-Command python -ErrorAction Stop).Source }
+        $modelOpts = @()
+        if ($SkipDownloads -or $VerifyOnly) { $modelOpts = @('--verify-only') }
+        & $modelPython (Join-Path $baseDir 'install_audio_model.py') @modelOpts
+        if ($LASTEXITCODE -ne 0) { throw 'RNNoise model installation or verification failed.' }
+        $filters = (& (Join-Path $toolsDir 'ffmpeg.exe') -hide_banner -filters 2>&1 | Out-String)
+        if ($LASTEXITCODE -ne 0 -or $filters -notmatch '\barnndn\b') { throw 'AI audio needs FFmpeg with the arnndn filter.' }
+    }
     Write-Host 'Setup complete. Start the application with run.bat.' -ForegroundColor Green
 }
 

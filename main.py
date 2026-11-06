@@ -297,6 +297,7 @@ class MainWindow(QMainWindow):
         self._smart_native_conversion = False
         self._hdr_peak_nits = 600
         self._atmos_status_cache = None
+        self._audio_ai_model_cache = None
         self._readiness_notice = None
         self.settings_file = WORKSPACE / "ui_preferences.json"
         self.sr_available, self.interp_available = ai_tools_available()
@@ -420,6 +421,9 @@ class MainWindow(QMainWindow):
             self.export_preset.addItem(label, key)
         export.addWidget(QLabel("导出方案"))
         export.addWidget(self.export_preset)
+        self.ai_denoise = QCheckBox("AI 人声降噪")
+        self.ai_denoise.setToolTip("适合带风扇声、底噪的对白录音。音乐建议关闭。无损母带、Atmos 和多声道沿用原音。")
+        export.addWidget(self.ai_denoise)
         self.automatic_summary = QLabel("添加视频后自动检查格式。\n通常无需调整设置，直接开始处理。")
         self.smart_summary = self.automatic_summary
         self.automatic_summary.setObjectName("automaticSummary")
@@ -720,6 +724,7 @@ class MainWindow(QMainWindow):
         self.rpu_mode.currentIndexChanged.connect(self.update_control_states)
         self.rpu.changed.connect(self.rpu_selected)
         self.audio_mode.currentIndexChanged.connect(self.audio_mode_selected)
+        self.ai_denoise.toggled.connect(self.ai_denoise_changed)
         self.atmos_backend.currentIndexChanged.connect(self.atmos_settings_changed)
         self.dee_path.changed.connect(self.atmos_settings_changed)
         self.dee_profile.changed.connect(self.atmos_settings_changed)
@@ -865,6 +870,17 @@ class MainWindow(QMainWindow):
         self.atmos_settings_changed()
         QTimer.singleShot(0, lambda: self.content_scroll.ensureWidgetVisible(self.atmos_group))
 
+    def audio_ai_model_ready(self):
+        from install_audio_model import MODEL_PATH, model_ready
+        try:
+            info = MODEL_PATH.stat()
+        except OSError:
+            return False
+        key = (MODEL_PATH, info.st_mtime_ns, info.st_size)
+        if self._audio_ai_model_cache is None or self._audio_ai_model_cache[0] != key:
+            self._audio_ai_model_cache = key, model_ready(MODEL_PATH)
+        return self._audio_ai_model_cache[1]
+
     def audio_readiness(self, cfg):
         """Describe the next audio action without changing widgets or contacting services."""
         def needs(action, title, detail, button):
@@ -881,9 +897,15 @@ class MainWindow(QMainWindow):
             return needs("add_audio", "请添加音轨", "双杜比需要音轨。请拖入音频，或选择自带声音的视频。", "添加音轨…")
         if free_audio:
             try:
-                self.free_audio_plan(info)
+                plan = self.free_audio_plan(info)
             except ValueError as exc:
                 return needs("add_audio", "请更换音轨", str(exc), "更换音轨…")
+            if cfg.get("ai_denoise"):
+                from ai_audio import ai_skip_reason
+                if not ai_skip_reason(plan) and not self.audio_ai_model_ready():
+                    return needs("audio_ai_model", "请安装人声降噪模型",
+                                 "请在工作站目录运行 setup.bat -CoreOnly -WithAudioAI。也可以先关闭“AI 人声降噪”导出原音。",
+                                 "模型安装说明…")
             return None
         if cfg.get("audio_mode") not in ("atmos_auto", "copy"):
             return needs("audio_settings", "请调整 Atmos 音频设置", "双杜比需要真正的 Atmos。请把音频编码改为“自动 Atmos”，或改选仅杜比视界方案。", "调整音频…")
@@ -1089,10 +1111,21 @@ class MainWindow(QMainWindow):
         if required:
             self.atmos_status.setText(self.atmos_backend_status().get("message", "尚未配置 Atmos 编码器"))
 
-    @staticmethod
-    def free_audio_plan(info):
+    def ai_denoise_changed(self):
+        self.update_audio_hint()
+        if self.vinfo and not self.last_output:
+            self.render_source_quality()
+
+    def free_audio_plan(self, info):
         from hires_audio import choose_free_audio_stream
         _, plan = choose_free_audio_stream((info or {}).get("audio_streams") or [])
+        if self.export_preset.currentData() == "bili_hires" and self.ai_denoise.isChecked():
+            from ai_audio import ai_skip_reason
+            reason = ai_skip_reason(plan)
+            if reason:
+                plan["detail"] += "。跳过 AI 人声降噪。" + reason
+            else:
+                plan["detail"] = "将使用 AI 减轻对白底噪。处理后的音轨以 ALAC 保存。音乐建议关闭。"
         return plan
 
     def free_audio_hint(self, info):
@@ -1363,6 +1396,7 @@ class MainWindow(QMainWindow):
             "hdr_peak_nits": self._hdr_peak_nits,
             "source_transfer_override": self.source_transfer.currentData() if route != "preserve" else "auto",
             "audio_mode": self.audio_mode.currentData(), "auto_clean": self.clean.isChecked(),
+            "ai_denoise": self.export_preset.currentData() == "bili_hires" and self.ai_denoise.isChecked(),
             "preset": self.encoding_preset.currentData(), "crf": self.crf.value(),
             "batch_size": self.batch_size.value(), "require_atmos": self.export_preset.currentData() == "bili_dual" or self.audio_mode.currentData() == "atmos_auto",
         }
@@ -1422,6 +1456,7 @@ class MainWindow(QMainWindow):
         route = self.current_route()
         running = self.worker is not None
         self.update_atmos_visibility()
+        self.ai_denoise.setVisible(self.export_preset.currentData() == "bili_hires")
         self.audio_mode.setEnabled(self.export_preset.currentData() != "bili_hires" and not running)
         for control in (self.resolution, self.fps, self.color):
             control.setEnabled(route != "preserve" and not running)
@@ -1623,6 +1658,9 @@ class MainWindow(QMainWindow):
         free_audio = report.get("export", {}).get("free_audio") or {}
         if free_audio.get("detail") and not any(c.get("detail") == free_audio["detail"] for c in chosen):
             details.insert(0, free_audio["detail"])
+        denoise = report.get("export", {}).get("ai_denoise") or {}
+        if denoise.get("detail") and not any(denoise["detail"] in line for line in details):
+            details.insert(0, denoise["detail"])
         bili = report.get("bilibili_readiness")
         if isinstance(bili, dict):
             readiness = {"pass": "符合公开指引的本地技术条件", "warning": "存在待确认事项", "fail": "尚不符合杜比 8.4 条件"}.get(bili.get("status"), "待检查")
@@ -1737,6 +1775,7 @@ class MainWindow(QMainWindow):
             self.ai.setChecked(cfg.get("ai", False))
             self.interp.setChecked(cfg.get("interp", False))
             self.clean.setChecked(cfg.get("auto_clean", True))
+            self.ai_denoise.setChecked(cfg.get("ai_denoise") is True)
             self.crf.setValue(int(cfg.get("crf", 18)))
             self.batch_size.setValue(int(cfg.get("batch_size", 32)))
             self._audio_mode_explicit = True
@@ -1798,6 +1837,8 @@ class MainWindow(QMainWindow):
                 self.show_atmos_settings()
             elif audio_action["action"] == "add_audio":
                 self.audio.browse()
+            elif audio_action["action"] == "audio_ai_model":
+                QMessageBox.information(self, audio_action["title"], audio_action["detail"])
             else:
                 self.advanced_toggle.setChecked(True)
                 QTimer.singleShot(0, lambda: self.content_scroll.ensureWidgetVisible(self.audio_mode))
@@ -2003,7 +2044,8 @@ class MainWindow(QMainWindow):
         keys = ("color_mode", "audio_mode", "model", "preset", "crf", "batch_size", "auto_clean", "hdr_remaster")
         data = {key: cfg[key] for key in keys}
         data.update({"version": 2, "export_preset": self.export_preset.currentData(),
-                     "resolution": self.resolution.currentData(), "fps": self.fps.currentData()})
+                     "resolution": self.resolution.currentData(), "fps": self.fps.currentData(),
+                     "ai_denoise": self.ai_denoise.isChecked()})
         data.update(self.atmos_config())
         # Upload/cost consent is deliberately a per-application-session choice.
         data["cloud_atmos"]["allow_upload"] = False
@@ -2040,6 +2082,7 @@ class MainWindow(QMainWindow):
             self.crf.setValue(data.get("crf", 18))
             self.batch_size.setValue(data.get("batch_size", 32))
             self.clean.setChecked(data.get("auto_clean", True))
+            self.ai_denoise.setChecked(data.get("ai_denoise") is True)
             self._preset_explicit = not migrate
             self._audio_mode_explicit = not migrate and "audio_mode" in data
             self.update_control_states()
