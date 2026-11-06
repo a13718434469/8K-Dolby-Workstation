@@ -185,6 +185,8 @@ function Invoke-WorkstationSetup {
         if ($SkipDownloads -or $VerifyOnly) { $modelOpts = @('--verify-only') }
         & $modelPython (Join-Path $baseDir 'music_sr_backend.py') @modelOpts
         if ($LASTEXITCODE -ne 0) { throw 'Music super-resolution model installation or verification failed.' }
+        & $modelPython (Join-Path $baseDir 'flashsr_official.py') @modelOpts
+        if ($LASTEXITCODE -ne 0) { throw 'Official FlashSR model installation or verification failed.' }
     }
     if ($WithAudioAI) {
         $modelPython = Join-Path $baseDir '.venv/Scripts/python.exe'

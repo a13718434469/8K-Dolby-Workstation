@@ -1138,8 +1138,13 @@ class MainWindow(QMainWindow):
         if treatment == "music_sr":
             from music_sr import sr_skip_reason
             reason = sr_skip_reason(plan)
+            kind = ""
+            if plan["action"] in ("alac", "pcm") and plan["codec"] != "wavpack":
+                kind = "无损"
+            elif plan["action"] == "copy":
+                kind = "有损"
             plan["detail"] = (plan["detail"] + "。" + reason if reason else
-                              f"已选 {plan['codec'].upper()} 音轨，将检测带宽并用本机 AI 补充缺失的高频细节")
+                              f"已选 {plan['codec'].upper()} {kind}音轨，将检测带宽并用本机 AI 补充缺失的高频细节")
         if treatment == "denoise":
             from ai_audio import ai_skip_reason
             reason = ai_skip_reason(plan)

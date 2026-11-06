@@ -15,7 +15,7 @@ call "%~dp0setup.bat" -CoreOnly
 if errorlevel 1 goto failed
 
 :launch
-"%~dp0.venv\Scripts\python.exe" "%~dp0main.py" %*
+"%~dp0.venv\Scripts\python.exe" "%~dp0consumer_app.py" %*
 set "RESULT=%ERRORLEVEL%"
 popd
 if not "%RESULT%"=="0" (

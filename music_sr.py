@@ -141,8 +141,9 @@ def _restore_sample_grid(predicted, step):
     return _filter(stretched, (step * kernel / kernel.sum()).astype(np.float32))[::3]
 
 
-def _render(dry, wet, length, channels, cutoff, model, cancel):
-    from music_sr_backend import upscale
+def _render(dry, wet, length, channels, cutoff, model, cancel, upscale=None):
+    if upscale is None:
+        from music_sr_backend import upscale
     step = 3 if cutoff >= 6900 else min(6, max(4, math.ceil(24000 / (cutoff + 150))))
     nyquist = RATE / (2 * step)
     antialias = _lowpass(nyquist - 340)
@@ -183,7 +184,7 @@ def _render(dry, wet, length, channels, cutoff, model, cancel):
     return peak, 10 * math.log10(max(ratio, 1e-20))
 
 
-def enhance_audio(ffmpeg, source, plan, duration, audio_offset, output, workdir, run, cancel_check):
+def enhance_audio(ffmpeg, source, plan, duration, audio_offset, output, workdir, run, cancel_check, *, official=False):
     """Create an aligned MP4 audio track only when extension is warranted."""
     skip = sr_skip_reason(plan)
     if skip:
@@ -208,10 +209,19 @@ def enhance_audio(ffmpeg, source, plan, duration, audio_offset, output, workdir,
             cutoff = _cutoff(dry, length, channels, plan["sample_rate"], cancel_check)
             if cutoff is None:
                 return {"applied": False, "detail": "没有测到需要扩展的频带，保留原音"}
-            from music_sr_backend import load_model, MODEL_SHA256
-            model = load_model()
+            if official:
+                import flashsr_official as backend
+                if not backend.model_ready():
+                    return {"applied": False, "detail": "音质增强组件不可用，保留原音"}
+                try:
+                    model = backend.load_model()
+                except (ImportError, OSError, RuntimeError, ValueError):
+                    return {"applied": False, "detail": "本机未能启动音质增强组件，保留原音"}
+            else:
+                import music_sr_backend as backend
+                model = backend.load_model()
             with wet_path.open("wb") as wet:
-                peak, relative_db = _render(dry, wet, length, channels, cutoff, model, cancel_check)
+                peak, relative_db = _render(dry, wet, length, channels, cutoff, model, cancel_check, backend.upscale)
         if relative_db < -68:
             return {"applied": False, "detail": "模型推测的高频能量很弱，保留原音", "cutoff_hz": cutoff}
         if relative_db > -3:
@@ -220,10 +230,11 @@ def enhance_audio(ffmpeg, source, plan, duration, audio_offset, output, workdir,
         cancel_check()
         run([ffmpeg, "-nostdin", "-v", "error", "-xerror", "-y", "-f", "f32le", "-ar", str(RATE),
              "-ac", str(channels), "-i", str(wet_path), "-af", f"volume={gain:.12g}",
-             "-c:a", "alac", "-sample_fmt", "s16p", "-movie_timescale", str(RATE), str(output)])
+             "-c:a", "alac", "-sample_fmt", "s32p" if official else "s16p", "-movie_timescale", str(RATE), str(output)])
     layout = "立体声" if channels == 2 else "单声道"
-    return {"applied": True, "method": "NovaSR + source-band preservation", "model_sha256": MODEL_SHA256,
-            "cutoff_hz": cutoff, "sample_rate": RATE, "channels": channels, "output_codec": "alac", "output_bits": 16,
+    return {"applied": True, "method": "FlashSR official ONNX" if official else "NovaSR + source-band preservation",
+            "model_sha256": backend.MODEL_SHA256, "delivery_hi_res": official, "native_hires": False,
+            "cutoff_hz": cutoff, "sample_rate": RATE, "channels": channels, "output_codec": "alac", "output_bits": 24 if official else 16,
             "verified_samples": length, "generated_highband_relative_db": round(relative_db, 2),
             "headroom_gain_db": round(20 * math.log10(gain), 3),
             "detail": f"AI 音乐超分为约 {cutoff / 1000:g} kHz 带限音轨补充了高频，输出 48 kHz {layout}重制音轨"}
@@ -233,7 +244,7 @@ def verify_sr_output(stream, outcome):
     try:
         from fractions import Fraction
         samples = int(stream["duration_ts"]) * Fraction(stream["time_base"]) * RATE
-        ok = (stream.get("codec_name") == "alac" and int(stream["bits_per_raw_sample"]) == 16
+        ok = (stream.get("codec_name") == "alac" and int(stream["bits_per_raw_sample"]) == outcome.get("output_bits", 16)
               and int(stream["sample_rate"]) == RATE and int(stream["channels"]) == outcome["channels"]
               and abs(float(stream["start_time"])) <= 1 / RATE and samples == outcome["verified_samples"])
     except (ValueError, ZeroDivisionError, KeyError, TypeError):

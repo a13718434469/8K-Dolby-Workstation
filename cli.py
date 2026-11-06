@@ -16,6 +16,7 @@ def main(argv=None):
     parser.add_argument("--auto-dolby", action="store_true", help="自动制作 B站杜比视界 8.4；合规原片直接保留，其他素材自动分析生成元数据（4K60以内）")
     parser.add_argument("--auto-double-dolby", action="store_true", help="自动制作杜比视界 8.4 + 真正 Atmos；普通音轨需要已配置的 Atmos 编码器，不允许降级为普通音频")
     parser.add_argument("--auto-free", action="store_true", help="免费本地制作杜比视界 8.4；保留现成 Atmos、无损母版或普通原声音质，不使用云编码")
+    parser.add_argument("--bili-one-click", action="store_true", help="一键制作 B站投稿 MP4，自动选择帧率、杜比视界及可用音轨")
     parser.add_argument("--ai-denoise", action="store_true", help="免费模式可选：用本地神经网络减轻普通单/双声道对白中的噪声")
     parser.add_argument("--music-sr", action="store_true", help="用本地模型补充带宽不足的音乐和视频原声的高频细节")
     ai = parser.add_mutually_exclusive_group()
@@ -69,6 +70,19 @@ def main(argv=None):
             cfg = dict(cp["cfg"], resume=True)
             if cfg.get("atmos_backend") == "aws" and cfg.get("audio_mode") == "atmos_auto":
                 cfg["cloud_atmos"] = dict(cfg.get("cloud_atmos") or {}, allow_upload=args.allow_cloud_upload)
+        elif args.bili_one_click:
+            if not args.input:
+                parser.error("一键制作需要 --input 视频")
+            allowed = {"--bili-one-click", "-i", "--input", "-o", "--output", "--audio", "--workspace",
+                       "--preset", "--crf", "--keep-temp"}
+            if explicit - allowed:
+                parser.error("--bili-one-click 会自动选择交付参数；如需手动调节，请使用其他导出方案")
+            from consumer_picture import make_job
+            from quality import inspect_media
+            cfg = make_job(inspect_media(args.input), args.input, args.output, args.audio, args.workspace)
+            if "--preset" in explicit:
+                cfg["preset"] = args.preset
+            cfg.update(crf=args.crf, auto_clean=not args.keep_temp)
         else:
             if not args.input:
                 parser.error("新任务需要 --input")
