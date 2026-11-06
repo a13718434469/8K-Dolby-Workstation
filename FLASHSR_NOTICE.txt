@@ -1,0 +1,14 @@
+FlashSR by Yatharth Sharma
+
+The consumer app runs the author's published ONNX graph as distributed, using
+Microsoft ONNX Runtime. The model card specifies the Apache License, Version 2.0.
+The full license text is included in NOVASR_NOTICE.txt under "Apache License".
+
+Model: https://huggingface.co/YatharthS/FlashSR
+Upstream usage and architecture credits: https://github.com/ysharma3501/FlashSR
+Model revision: 3e19cc92e655c2e0661e6268efdade60f42fd0b8
+File: onnx/model.onnx
+SHA-256: e255c76b227f16f7f392cc43677c38bd2c5aa129f042a2ba3eb03fb29e470c7a
+
+The host application handles audio track selection, frequency analysis, timeline
+alignment, stereo processing and output encoding. These are application functions.

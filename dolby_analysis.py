@@ -1,4 +1,4 @@
-"""Independent CPU Profile 8.4 measurements; not Dolby's proprietary analysis.
+"""Independent Profile 8.4 measurements; not Dolby's proprietary analysis.
 
 The actual installed dovi_tool supplies the polynomial/MMR/DM composer. Native
 4:2:0 is composed before chroma upsampling. Pixel processing holds one raw frame
@@ -8,6 +8,8 @@ proportional to the clip length. See DOLBY_ANALYSIS_NOTICE.md.
 from __future__ import annotations
 
 import csv
+from collections import deque
+from contextlib import nullcontext
 import hashlib
 import json
 import math
@@ -26,7 +28,7 @@ import numpy as np
 
 # Bump this identity whenever reconstruction/statistics/quantization changes;
 # pipeline caches must compare it as well as base-video and generated-RPU hashes.
-METHOD = "independent-p84-spec420-pq-maxrgb-v1"
+METHOD = "independent-p84-spec420-pq-maxrgb-shot-v2"
 _FLAGS = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
@@ -327,6 +329,113 @@ def _ffprobe(ffmpeg, ffprobe):
     return str(sibling) if sibling.is_file() else shutil.which("ffprobe") or "ffprobe"
 
 
+class ShotDetector:
+    """Detect persistent image cuts, allowing one or two frames of transient flash."""
+    def __init__(self):
+        self.history = deque(maxlen=6)
+        self.starts = [0]
+        self.index = -1
+        self.next_cut = 1
+
+    @staticmethod
+    def sketch(y, cb, cr):
+        # Four samples per cell reduce sensitivity to fine motion. Only cut
+        # detection is subsampled; L1 still measures every full-resolution frame.
+        def grid(plane):
+            h, w = plane.shape
+            gh, gw = min(48, h), min(80, w)
+            result = np.zeros((gh, gw), dtype=np.float32)
+            for dy in (.25, .75):
+                rows = ((np.arange(gh) + dy) * h / gh).astype(int)
+                for dx in (.25, .75):
+                    cols = ((np.arange(gw) + dx) * w / gw).astype(int)
+                    result += plane[np.ix_(rows, cols)]
+            return result.ravel() / 4092.
+        return tuple(grid(p) for p in (y, cb, cr))
+
+    @staticmethod
+    def distance(a, b):
+        return max(float(np.abs(x - y).mean()) * weight
+                   for x, y, weight in zip(a, b, (1., .65, .65)))
+
+    def _assess(self, boundary):
+        views = dict(self.history)
+        old, new = views[boundary - 1], views[boundary]
+        gap = self.distance(old, new)
+        if gap < .085:
+            return
+        if boundary - 2 in views:
+            baseline = self.distance(views[boundary - 2], old)
+            if gap - baseline < .06:
+                return
+        threshold = min(.040, gap * .30)
+        # A flash followed by a return to the prior shot should not cause
+        # display metadata to reset both when it starts and when it ends.
+        if any(self.distance(old, views[i]) < threshold for i in (boundary + 1, boundary + 2) if i in views):
+            return
+        if any(self.distance(new, views[i]) < threshold for i in (boundary - 2, boundary - 3) if i in views):
+            return
+        self.starts.append(boundary)
+
+    def push(self, sketch):
+        self.index += 1
+        self.history.append((self.index, sketch))
+        if self.next_cut <= self.index - 2:
+            self._assess(self.next_cut)
+            self.next_cut += 1
+
+    def finish(self):
+        while self.next_cut <= self.index:
+            self._assess(self.next_cut)
+            self.next_cut += 1
+        return self.starts.copy()
+
+
+def write_shot_config(raw_stats, starts, frames, config_path, stats_path=None, cancel_check=None):
+    """Pool raw PQ measurements within each shot before L1 quantization/clamping."""
+    if frames < 1 or not starts or starts[0] != 0 or starts != sorted(set(starts)) or starts[-1] >= frames:
+        raise AnalysisError("Invalid shot boundaries")
+    shots = []
+    with Path(raw_stats).open(encoding="utf-8") as source:
+        for start, end in zip(starts, starts[1:] + [frames]):
+            minimum, maximum, total = 1., 0., 0.
+            for i in range(start, end):
+                _cancel(cancel_check)
+                line = source.readline()
+                if not line:
+                    raise AnalysisError("Incomplete shot measurements")
+                row = json.loads(line)
+                if row["frame"] != i:
+                    raise AnalysisError("Misordered shot measurements")
+                pq = row["measured_pq"]
+                minimum = min(minimum, pq["min_pq"])
+                maximum = max(maximum, pq["max_pq"])
+                total += pq["avg_pq"]
+            duration = end - start
+            level = clamp_l1(quantize_pq(minimum), quantize_pq(maximum), quantize_pq(total / duration))
+            shots.append({"start": start, "duration": duration, "metadata_blocks": [{"Level1": level}]})
+        if source.readline():
+            raise AnalysisError("Unexpected extra shot measurements")
+    _atomic_json(Path(config_path), {"cm_version": "V40", "profile": "8.4", "length": frames, "shots": shots})
+    digest, changes, last = hashlib.sha256(), 0, None
+    with Path(raw_stats).open(encoding="utf-8") as source, (
+            Path(stats_path).open("w", encoding="utf-8", newline="\n") if stats_path else nullcontext()) as out:
+        for shot in shots:
+            level = shot["metadata_blocks"][0]["Level1"]
+            packed = struct.pack(">HHH", *[level[k] for k in ("min_pq", "max_pq", "avg_pq")])
+            changes += int(last is not None and last != packed)
+            last = packed
+            for i in range(shot["duration"]):
+                _cancel(cancel_check)
+                digest.update(packed)
+                if out is not None:
+                    row = json.loads(source.readline())
+                    row.update(shot_start=shot["start"], scene_refresh=(i == 0), encoded_l1=level)
+                    out.write(json.dumps(row, separators=(",", ":")) + "\n")
+    return {"shot_starts": starts, "shot_count": len(shots), "encoded_l1_changes": changes,
+            "encoded_l1_sha256": digest.hexdigest(), "temporal_mapping": "one_L1_per_detected_shot"}
+
+
 def verify_rpu(dovi_tool, rpu_path, report, cancel_check=None):
     """Verify every L1 and frame count, plus only the first composer's fingerprint.
 
@@ -337,7 +446,15 @@ def verify_rpu(dovi_tool, rpu_path, report, cancel_check=None):
     rpu_path = Path(rpu_path).resolve()
     with tempfile.TemporaryDirectory(prefix="verify-rpu-", dir=rpu_path.parent) as directory:
         exported = Path(directory) / "l1.csv"
-        _command([dovi_tool, "export", "-i", rpu_path, "--levels", "level1=" + str(exported)], cancel_check)
+        args = [dovi_tool, "export", "-i", rpu_path, "--levels", "level1=" + str(exported)]
+        refresh = Path(directory) / "scenes.txt"
+        if "shot_starts" in report:
+            args += ["--data", "scenes=" + str(refresh)]
+        _command(args, cancel_check)
+        if "shot_starts" in report:
+            indices = [int(line) for line in refresh.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+            if indices != report["shot_starts"]:
+                raise AnalysisError("Written RPU scene refresh flags differ from detected cuts")
         digest, count = hashlib.sha256(), 0
         with exported.open(encoding="utf-8", newline="") as source:
             for row in csv.DictReader(source):
@@ -355,6 +472,7 @@ def verify_rpu(dovi_tool, rpu_path, report, cancel_check=None):
             raise AnalysisError("Written RPU changed the measured composer")
         return {"verified": True, "frame_count": count, "l1_sha256": digest.hexdigest(),
                 "l1_frames_verified": count, "composer_frames_verified": 1,
+                "scene_refresh_flags_verified": "shot_starts" in report,
                 "verification_scope": "all_frame_l1_and_first_frame_composer",
                 "all_frames_composer_verified": False,
                 "composer_sha256": fingerprint, "rpu_sha256": _sha256(rpu_path, cancel_check)}
@@ -396,9 +514,19 @@ def analyze_video(ffmpeg, video, workdir, expected_frames, *, dovi_tool, profile
         _command([dovi_tool, "generate", "-j", template_cfg, "-p", "8.4", "-o", template_rpu], cancel_check)
         template = _json(_command([dovi_tool, "info", "-i", template_rpu, "-f", "0"], cancel_check))
         composer = Profile84Composer(template)
+        meter = None
+        gpu_frames = 0
+        if width * height >= 3840 * 2160 and os.environ.get("DOLBY_FORCE_CPU_ANALYSIS") != "1":
+            # Driver availability and FP64 numerical agreement are checked per job.
+            try:
+                from dolby_opencl import verified_meter
+                meter = verified_meter(composer, measure_frame)
+            except Exception:
+                meter = None
         config_path, stats_path = job / "generator.json", job / "measurements.jsonl"
         config_partial, stats_partial = job / "generator.json.partial", job / "measurements.jsonl.partial"
-        expected_digest, count, changed, previous = hashlib.sha256(), 0, 0, None
+        raw_stats = job / "raw-measurements.jsonl.partial"
+        detector, count = ShotDetector(), 0
         argv = [str(ffmpeg), "-nostdin", "-v", "error", "-xerror", "-noautorotate", "-i", str(video), "-map", "0:v:0",
                 "-an", "-sn", "-dn", "-fps_mode", "passthrough", "-pix_fmt", "yuv420p10le", "-f", "rawvideo", "-"]
         with (job / "decode.log").open("wb") as errors:
@@ -406,8 +534,7 @@ def analyze_video(ffmpeg, video, workdir, expected_frames, *, dovi_tool, profile
                                        creationflags=_FLAGS, bufsize=0)
             reader = _RawReader(process.stdout)
             try:
-                with config_partial.open("w", encoding="utf-8", newline="\n") as config, stats_partial.open("w", encoding="utf-8", newline="\n") as stats:
-                    config.write('{"cm_version":"V40","profile":"8.4","length":' + str(expected_frames) + ',"shots":[')
+                with raw_stats.open("w", encoding="utf-8", newline="\n") as stats:
                     while True:
                         _cancel(cancel_check)
                         frame = reader.frame(width * height * 3, cancel_check)
@@ -419,20 +546,25 @@ def analyze_video(ffmpeg, video, workdir, expected_frames, *, dovi_tool, profile
                         y = plane[:pixels].reshape(height, width)
                         cb = plane[pixels:pixels + pixels // 4].reshape(height // 2, width // 2)
                         cr = plane[pixels + pixels // 4:].reshape(height // 2, width // 2)
-                        result = measure_frame(y, cb, cr, composer, chroma_location=location, cancel_check=cancel_check)
-                        encoded = result["encoded_l1"]
-                        sequence = tuple(encoded[k] for k in ("min_pq", "max_pq", "avg_pq"))
-                        expected_digest.update(struct.pack(">HHH", *sequence))
-                        changed += previous is not None and sequence != previous
-                        previous = sequence
-                        if count:
-                            config.write(",")
-                        json.dump({"start": count, "duration": 1, "metadata_blocks": [{"Level1": encoded}]}, config, separators=(",", ":"))
-                        stats.write(json.dumps({"frame": count, **result}, separators=(",", ":")) + "\n")
+                        detector.push(detector.sketch(y, cb, cr))
+                        measured = None
+                        if meter is not None:
+                            try:
+                                measured = meter.stats(y, cb, cr, location)
+                            except Exception:
+                                # Recover even from a device reset without dropping this frame.
+                                meter = None
+                        if measured is None:
+                            result = measure_frame(y, cb, cr, composer, chroma_location=location, cancel_check=cancel_check)
+                        else:
+                            gpu_frames += 1
+                            codes = {k: quantize_pq(v) for k, v in measured.items()}
+                            result = {"measured_pq": measured, "measured_l1": codes, "encoded_l1": clamp_l1(**codes)}
+                        stats.write(json.dumps({"frame": count, "measured_pq": result["measured_pq"],
+                                                "measured_l1": result["measured_l1"]}, separators=(",", ":")) + "\n")
                         count += 1
                         if progress:
                             progress(90. * count / expected_frames)
-                    config.write("]}")
                 process.wait(timeout=10)
                 if process.returncode:
                     raise AnalysisError("Final HLG decoding failed: " + (job / "decode.log").read_text(encoding="utf-8", errors="replace")[-2000:])
@@ -443,13 +575,18 @@ def analyze_video(ffmpeg, video, workdir, expected_frames, *, dovi_tool, profile
                 reader.thread.join(timeout=2)
         if count != expected_frames:
             raise AnalysisError(f"Final frame count mismatch: expected {expected_frames}, measured {count}")
+        temporal = write_shot_config(raw_stats, detector.finish(), count, config_partial, stats_partial, cancel_check)
+        raw_stats.unlink()
         _cancel(cancel_check)
         rpu_partial = job / "measured-rpu.bin.partial"
         _command([dovi_tool, "generate", "-j", config_partial, "-p", "8.4", "-o", rpu_partial], cancel_check)
-        report = {"schema_version": 1, "method": METHOD, "analysis_kind": "independent_public_standard_per_frame",
+        report = {"schema_version": 2, "method": METHOD, "analysis_kind": "full_frame_measurement_shot_based_metadata",
                   "dolby_algorithm_equivalent": False, "visual_match_verified": False, "platform_verified": False,
                   "source_sha256": source_hash, "source": str(video), "width": width, "height": height,
-                  "input_pixel_format": "yuv420p10le", "input_range": "tv", "arithmetic": "float64 tiled CPU",
+                  "input_pixel_format": "yuv420p10le", "input_range": "tv",
+                  "arithmetic": ("float64 OpenCL" if gpu_frames == count else
+                                 "float64 OpenCL and CPU" if gpu_frames else "float64 tiled CPU"),
+                  "gpu_measured_frames": gpu_frames, "cpu_measured_frames": count - gpu_frames,
                   "frames": count, "all_frames_measured": True, "full_resolution": True,
                   "composer_sha256": composer.fingerprint, "composer_source": version + " generate -p 8.4",
                   "composer_input_normalization": "code / 2^BL_bit_depth (10-bit /1024)",
@@ -458,16 +595,17 @@ def analyze_video(ffmpeg, video, workdir, expected_frames, *, dovi_tool, profile
                   "minimum_statistic": "minimum minRGB", "average_statistic": "arithmetic mean of PQ maxRGB, after spatial reduction",
                   "quantization": "clip(floor(pq*4095+0.5),0,4095)", "cm_version": "V40",
                   "source_range_pq_codes": composer.source_range, "measurement_source_range_clamp": False,
-                  "encoded_l1_sha256": expected_digest.hexdigest(), "encoded_l1_changes": int(changed),
+                  **temporal,
                   "measurements": str(stats_path),
                   "limitations": ["Independent analysis is not Dolby CM4 proprietary analysis or certification.",
-                                  "No Dolby long-play 20-second temporal analysis or artistic trims are performed.",
+                                  "Cuts are automatically estimated; independent shot pooling is not Dolby's proprietary analysis.",
                                   "Bilinear post-composer chroma interpolation is a declared reconstruction choice.",
                                   "2x2 reduction uses PQ component space, a domain not explicitly fixed in the public text.",
                                   "All canvas pixels are included; letterbox bars are not automatically excluded.",
                                   "CM4 L1 limits can flatten dark-scene statistics; measured and encoded values are recorded."]}
         verification = verify_rpu(dovi_tool, rpu_partial, report, cancel_check)
-        report.update(written_l1_verified=True, rpu_sha256=verification["rpu_sha256"],
+        report.update(written_l1_verified=True, scene_refresh_flags_verified=verification["scene_refresh_flags_verified"],
+                      rpu_sha256=verification["rpu_sha256"],
                       l1_frames_verified=verification["l1_frames_verified"],
                       composer_frames_verified=verification["composer_frames_verified"],
                       verification_scope=verification["verification_scope"],

@@ -132,6 +132,30 @@ class ActualComposerTests(unittest.TestCase):
                 expected.append(min(1., max(0., value)))
             np.testing.assert_allclose(actual[component], expected, atol=2e-13)
 
+    def test_available_opencl_device_matches_encoded_l1_on_structured_pixels(self):
+        try:
+            import pyopencl as cl
+        except ImportError:
+            self.skipTest("Optional OpenCL binding unavailable")
+        try:
+            platforms = cl.get_platforms()
+        except cl.Error:
+            self.skipTest("No OpenCL platform")
+        if not any(d.double_fp_config and d.type & cl.device_type.GPU
+                   for p in platforms for d in p.get_devices()):
+            self.skipTest("No FP64 OpenCL GPU")
+        from dolby_opencl import verified_meter
+        meter = verified_meter(self.composer, analysis.measure_frame)
+        row = np.arange(384, dtype=np.uint16)
+        y = (np.arange(218, dtype=np.uint16)[:, None] * 5 + row[None, :]) % 1024
+        cb, cr = y[::2, ::2].copy(), np.flip(y[1::2, 1::2], axis=1).copy()
+        for location in ("left", "topleft"):
+            expected = analysis.measure_frame(y, cb, cr, self.composer, chroma_location=location)
+            actual = meter.stats(y, cb, cr, location)
+            self.assertEqual({k: analysis.quantize_pq(v) for k, v in actual.items()}, expected["measured_l1"])
+            for k in actual:
+                self.assertAlmostEqual(actual[k], expected["measured_pq"][k], places=10)
+
     def test_tile_sizes_do_not_change_native420_measurement(self):
         rng = np.random.default_rng(2026)
         y = rng.integers(64, 941, (48, 64), dtype=np.uint16)
@@ -168,7 +192,35 @@ class ActualComposerTests(unittest.TestCase):
         with self.assertRaises(analysis.AnalysisError):
             analysis.verify_rpu(DOVI, result["rpu_path"], changed)
         cfg = json.loads(Path(result["config_path"]).read_text())
-        self.assertEqual([s["duration"] for s in cfg["shots"]], [1] * 6)
+        self.assertEqual([s["duration"] for s in cfg["shots"]], [3, 3])
+        self.assertEqual(report["shot_starts"], [0, 3])
+        self.assertTrue(verified["scene_refresh_flags_verified"])
+        with self.assertRaisesRegex(analysis.AnalysisError, "scene refresh"):
+            analysis.verify_rpu(DOVI, result["rpu_path"], dict(report, shot_starts=[0, 2, 3]))
+
+    def test_short_flash_not_an_edit_and_interpolated_peaks_stay_stable(self):
+        detector = analysis.ShotDetector()
+        for v in [128, 128, 800, 128, 128, 128, 700, 700, 700, 700]:
+            y = np.full((48, 64), v, dtype=np.uint16)
+            chroma = np.full((24, 32), 512, dtype=np.uint16)
+            detector.push(detector.sketch(y, chroma, chroma))
+        self.assertEqual(detector.finish(), [0, 6])
+        with tempfile.TemporaryDirectory(dir=self.work) as folder:
+            root = Path(folder)
+            raw, cfg, ledger = (root / name for name in ("raw", "config.json", "frames.jsonl"))
+            samples = [(0., p, a) for p, a in zip([.89,.70,.88,.70,.89,.70,.63,.60,.63,.59],
+                                                   [.35]*6 + [.25]*4)]
+            raw.write_text("".join(json.dumps({"frame": i, "measured_pq": dict(zip(
+                ("min_pq","max_pq","avg_pq"), values))}) + "\n" for i, values in enumerate(samples)), encoding="utf-8")
+            temporal = analysis.write_shot_config(raw, detector.finish(), len(samples), cfg, ledger)
+            shots = json.loads(cfg.read_text(encoding="utf-8"))["shots"]
+            levels = [shot["metadata_blocks"][0]["Level1"] for shot in shots]
+            self.assertEqual([level["max_pq"] for level in levels],
+                             [analysis.quantize_pq(.89), analysis.quantize_pq(.63)])
+            self.assertEqual(temporal["encoded_l1_changes"], 1)
+            records = [json.loads(line) for line in ledger.read_text(encoding="utf-8").splitlines()]
+            self.assertEqual([r["frame"] for r in records if r["scene_refresh"]], [0,6])
+            self.assertEqual([r["encoded_l1"] for r in records], [levels[0]]*6 + [levels[1]]*4)
 
     def test_cancel_callback_exception_terminates_and_removes_partial_job(self):
         work = self.work / "cancelled"

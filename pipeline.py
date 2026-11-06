@@ -20,7 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent
 TOOLS_DIR = BASE_DIR / "tools"
 WORKSPACE = BASE_DIR / "workspace"
 CHECKPOINT_FILE = WORKSPACE / "checkpoint.json"
-VERSION = "2.4"
+VERSION = "3.2"
 
 
 class PipelineError(RuntimeError):
@@ -315,6 +315,8 @@ class Pipeline:
                 cfg["color_mode"] = {"smpte2084": "hdr10", "arib-std-b67": "hlg"}.get(source_transfer, "sdr")
         cfg.setdefault("color_mode", "sdr")
         cfg.setdefault("audio_mode", "copy")
+        if cfg.get("bili_one_click") and cfg["audio_mode"] != "hires":
+            raise PipelineError("一键投稿使用本地自动音轨方案")
         cfg.setdefault("ai", True)
         cfg.setdefault("interp", True)
         cfg.setdefault("auto_clean", True)
@@ -338,8 +340,12 @@ class Pipeline:
             raise PipelineError("自动元数据与手动 RPU 不能同时使用")
         if cfg["color_mode"] not in ("sdr", "hdr10", "dv81", "hlg", "dv84"):
             raise PipelineError("不支持的色彩模式")
-        if cfg["audio_mode"] not in ("copy", "aac", "eac3", "none", "atmos_auto"):
+        if cfg["audio_mode"] not in ("copy", "aac", "eac3", "none", "atmos_auto", "hires"):
             raise PipelineError("不支持的音频模式")
+        if type(cfg["ai_denoise"]) is not bool or (cfg["ai_denoise"] and cfg["audio_mode"] != "hires"):
+            raise PipelineError("AI 人声降噪仅用于免费本地音频路线")
+        if type(cfg["music_sr"]) is not bool or (cfg["music_sr"] and (cfg["audio_mode"] != "hires" or cfg["ai_denoise"])):
+            raise PipelineError("请在免费方案中选择一项音频处理：AI 音质增强或人声降噪")
         if not all(isinstance(cfg[k], int) and 16 <= cfg[k] <= 8192 and cfg[k] % 2 == 0
                    for k in ("width", "height")):
             raise PipelineError("输出宽高必须是 16 到 8192 之间的偶数")
@@ -413,6 +419,42 @@ class Pipeline:
         audio_data = _json_command([find_tool("ffprobe"), "-v", "error", "-show_streams",
                                     "-of", "json", self.audio_source])
         self.audio_stream = next((s for s in audio_data.get("streams", []) if s.get("codec_type") == "audio"), None)
+        self.free_audio = None
+        self.consumer_tracks = []
+        self.companion_audio = None
+        self.companion_offset = 0
+        self.consumer_atmos_note = ""
+        if cfg.get("bili_one_click"):
+            from consumer_audio import select_tracks
+            external = audio_data["streams"] if cfg.get("audio") and Path(self.audio_source) != video else None
+            self.consumer_tracks = select_tracks(self.info.get("audio_streams", ()), external)
+            if self.consumer_tracks:
+                track = self.consumer_tracks[0]
+                self.audio_stream, self.free_audio = track["stream"], track["plan"]
+                self.audio_source = str(video) if track["origin"] == "video" else cfg["audio"]
+        if cfg["audio_mode"] == "hires":
+            from hires_audio import choose_free_audio_stream, HiresAudioError
+            if cfg["require_atmos"] or (cfg.get("cloud_atmos") or {}).get("allow_upload"):
+                raise PipelineError("免费模式不使用云编码；强制制作 Atmos 请切换到双杜比方案")
+            if not self.audio_stream and not cfg.get("bili_one_click"):
+                raise PipelineError("文件没有音轨。请拖入音频母版，或选“仅杜比视界”导出静音视频")
+        if cfg["audio_mode"] == "hires" and self.audio_stream:
+            try:
+                if not self.free_audio:
+                    self.audio_stream, self.free_audio = choose_free_audio_stream(audio_data["streams"])
+            except HiresAudioError as exc:
+                raise PipelineError(str(exc)) from exc
+            self.log("[免费本地] " + self.free_audio["detail"])
+            if cfg["music_sr"]:
+                from music_sr import sr_skip_reason
+                from music_sr_backend import model_ready
+                if not sr_skip_reason(self.free_audio) and not model_ready():
+                    raise PipelineError("AI 音质增强模型尚未就绪，请运行项目内的 python music_sr_backend.py 安装")
+            if cfg["ai_denoise"]:
+                from ai_audio import ai_skip_reason, verify_ai_model
+                from install_audio_model import MODEL_PATH
+                if not ai_skip_reason(self.free_audio):
+                    verify_ai_model(find_tool("ffmpeg"), MODEL_PATH, self._run)
         self.audio_offset = 0.0
         if self.audio_stream and Path(self.audio_source).resolve() == video:
             try:
@@ -480,6 +522,9 @@ class Pipeline:
 
     @staticmethod
     def _dolby_defaults(cfg):
+        cfg.setdefault("bili_one_click", False)
+        cfg.setdefault("ai_denoise", False)
+        cfg.setdefault("music_sr", False)
         cfg.setdefault("source_transfer_override", "auto")
         cfg.setdefault("rpu_mode", "external" if cfg.get("rpu") else "auto")
         automatic = cfg.get("route") != "preserve" and cfg.get("color_mode") == "dv84" and cfg["rpu_mode"] == "auto"
@@ -538,10 +583,11 @@ class Pipeline:
     def _rpu_file(self):
         return str(getattr(self, "rpu_path", None) or self.cfg["rpu"])
 
-    def _verify_final_rpu(self, video):
+    def _verify_final_rpu(self, video, preserved_frames=None):
         """Extract through a pipe: validate every final RPU without a second HEVC copy."""
         from dolby_analysis import verify_rpu
         folder = self.job_dir / "auto-dolby"
+        folder.mkdir(exist_ok=True)
         output = folder / "final-extracted.bin"
         log_path = folder / "final-extraction.log"
         output.unlink(missing_ok=True)
@@ -563,8 +609,19 @@ class Pipeline:
                     self._cancel.wait(0.05)
                 if decoder.poll() != 0 or extractor.poll() != 0:
                     raise PipelineError("最终杜比元数据提取失败，未发布成片")
-            self.manifest["rpu_final_validation"] = verify_rpu(find_tool("dovi_tool"), output,
-                self.manifest["dolby_analysis"], cancel_check=self._boundary)
+            if preserved_frames is None:
+                self.manifest["rpu_final_validation"] = verify_rpu(find_tool("dovi_tool"), output,
+                    self.manifest["dolby_analysis"], cancel_check=self._boundary)
+            else:
+                # The untouched HEVC stream is hashed in _validate_copy. Also
+                # prove the MP4's Dolby declaration is backed by a full RPU track.
+                summary = self._run([find_tool("dovi_tool"), "info", "-i", output, "-s"])
+                frames = re.search(r"Frames:\s*(\d+)", summary)
+                if (preserved_frames < 1 or not frames or int(frames[1]) != preserved_frames
+                        or not re.search(r"Profile:\s*8\b", summary)):
+                    raise PipelineError("原片的杜比元数据未覆盖成片的全部画面，未保存输出")
+                self.manifest["rpu_final_validation"] = {
+                    "preserved_rpu_frames": preserved_frames, "encoded_video_sha256_matches_source": True}
         finally:
             for process in (extractor, decoder):
                 if process is not None and process.poll() is None:
@@ -715,6 +772,10 @@ class Pipeline:
             compat = 4 if self.cfg["color_mode"] == "dv84" else 1
             if dv.get("dv_profile") != 8 or dv.get("dv_bl_signal_compatibility_id") != compat:
                 raise PipelineError("输出缺少所选 Dolby Vision Profile 配置；不会发布为杜比视界成功结果")
+            if self.cfg.get("bili_one_click"):
+                from consumer_picture import supports_8k_dolby_level
+                if not supports_8k_dolby_level(video, video["width"], video["height"], self.rate):
+                    raise PipelineError("杜比视界解码级别与成片尺寸或帧率不符，未保存输出")
         return data
 
     def _encode_batches(self, frames):
@@ -829,7 +890,22 @@ class Pipeline:
         if getattr(self, "_generate_atmos", False):
             return self._generate_atmos_audio(duration)
         output = self.job_dir / "audio.mp4"
-        mode = self.cfg["audio_mode"]
+        if (self.cfg["music_sr"] or (self.cfg["bili_one_click"] and self.free_audio["action"] != "stereo_master")) and self._music_audio(output, duration):
+            return output
+        mode = self.free_audio["action"] if self.free_audio else self.cfg["audio_mode"]
+        if self.cfg["ai_denoise"]:
+            from ai_audio import analyze_ai_audio
+            from install_audio_model import MODEL_PATH
+            if "audio" not in self.manifest["completed"]:
+                self.manifest["ai_denoise"] = analyze_ai_audio(
+                    find_tool("ffmpeg"), self.audio_source, self.free_audio, duration, self.audio_offset,
+                    MODEL_PATH, self._run)
+            decision = self.manifest.get("ai_denoise")
+            if not isinstance(decision, dict) or type(decision.get("applied")) is not bool:
+                raise PipelineError("缺少降噪处理记录，请新建任务")
+            if decision["applied"]:
+                mode = "denoise"
+            self.log("[AI 人声降噪] " + decision["detail"])
         copy_preroll = max(-self.audio_offset, 0) if mode in ("copy", "atmos_auto") else 0.0
         if (copy_preroll and "audio" in self.manifest["completed"]
                 and self.manifest.get("audio_trimmed_preroll_seconds") != copy_preroll):
@@ -849,10 +925,21 @@ class Pipeline:
                 if not math.isfinite(seek) or seek < 0:
                     raise PipelineError("无法确认音频前滚在源容器中的起点，未继续复制")
                 cmd += ["-ss", f"{seek:.9f}"]
-            cmd += ["-i", self.audio_source, "-map", "0:a:0", "-vn"]
+            ordinal = self.free_audio["source_audio_ordinal"] if self.free_audio else 0
+            cmd += ["-i", self.audio_source, "-map", f"0:a:{ordinal}", "-vn"]
             if mode in ("copy", "atmos_auto"):
                 cmd += ["-c:a", "copy"]
                 self.log("[音频] 直接复制音轨；已有 E-AC-3/Atmos 数据不重新编码，短音轨按原长保留")
+            elif mode in ("alac", "pcm"):
+                from hires_audio import hires_encode_args
+                cmd += hires_encode_args(self.free_audio, duration, self.audio_offset)
+            elif mode == "stereo_master":
+                from consumer_audio import downmix_filter
+                cmd += ["-af", downmix_filter(self.free_audio, duration, self.audio_offset),
+                        "-c:a", "alac", "-sample_fmt", "s32p", "-movie_timescale", "48000"]
+            elif mode == "denoise":
+                from ai_audio import ai_encode_args
+                cmd += ai_encode_args(self.free_audio, decision, duration, self.audio_offset)
             else:
                 offset = round(self.audio_offset * 48000)
                 align = "aresample=48000,asetpts=PTS-STARTPTS,"
@@ -867,15 +954,20 @@ class Pipeline:
                     self.log("[音频] E-AC-3 编码支持最多 5.1 声道，将下混；此编码不会生成 Atmos 对象元数据")
             # Copy keeps pre-roll packets for MP4 edit-list alignment. Do not
             # truncate the end before the negative start offset is applied.
-            cmd += ["-t", f"{duration:.9f}", partial]
-            self._run(cmd)
+            if mode not in ("alac", "pcm", "denoise", "stereo_master"):
+                cmd += ["-t", f"{duration:.9f}"]
+            cmd += [partial]
+            if mode == "denoise":
+                self._run(cmd, cwd=MODEL_PATH.parent)
+            else:
+                self._run(cmd)
             data = _json_command([find_tool("ffprobe"), "-v", "error", "-show_streams", "-of", "json", str(partial)])
             if not any(s.get("codec_type") == "audio" for s in data.get("streams", [])):
                 raise PipelineError("音轨校验失败")
             os.replace(partial, output)
             self.manifest["audio_trimmed_preroll_seconds"] = copy_preroll
             self.manifest["audio_sha256"] = self._file_hash(output)
-            if mode in ("copy", "atmos_auto"):
+            if mode in ("copy", "atmos_auto") and not self.free_audio:
                 self.manifest["atmos_audio"] = {"generated": False, "method": "source_stream_copy",
                                                 "platform_verified": False}
             self._stage_done("audio")
@@ -886,27 +978,60 @@ class Pipeline:
         self.progress(90)
         return output
 
-    def _generate_atmos_audio(self, duration):
+    def _music_audio(self, output, duration):
+        from music_sr import enhance_audio, verify_sr_output
+        if "audio" in self.manifest["completed"]:
+            report = self.manifest.get("music_sr") or {}
+            if type(report.get("applied")) is not bool:
+                raise PipelineError("断点缺少 AI 音质增强记录，请新建任务")
+            if report["applied"] and (not output.is_file() or self._file_hash(output) != self.manifest.get("audio_sha256")):
+                raise PipelineError("断点中的 AI 音轨已改变，请新建任务")
+            return report["applied"]
+        partial = self.job_dir / "music.partial.mp4"
+        try:
+            report = enhance_audio(find_tool("ffmpeg"), self.audio_source, self.free_audio, duration,
+                                   self.audio_offset, partial, self.job_dir, self._run, self._boundary,
+                                   official=self.cfg["bili_one_click"])
+            self.log("[AI 音质增强] " + report["detail"])
+            self.manifest["music_sr"] = report
+            if not report["applied"]:
+                return False
+            verify_sr_output(self._inspect(partial, audio_only=True)["audio_streams"][0], report)
+            os.replace(partial, output)
+            self.manifest["audio_sha256"] = self._file_hash(output)
+            self._stage_done("audio")
+            self.progress(90)
+            return True
+        finally:
+            partial.unlink(missing_ok=True)
+
+    def _generate_atmos_audio(self, duration, *, companion_source=None, companion_offset=0):
         from atmos_encoding import prepare_master, encode_dee, AtmosError
         from quality import validate_atmos_audio
         folder = self.job_dir / "atmos"
         folder.mkdir(exist_ok=True)
-        output = self.job_dir / "audio.mp4"
+        stage = "consumer_atmos" if companion_source is not None else "audio"
+        output = self.job_dir / (stage + ".mp4")
+        hash_field = stage + "_sha256"
+        source = self.audio_source if companion_source is None else companion_source
+        stream = self.audio_stream if companion_source is None else self._inspect(source, audio_only=True)["audio_streams"][0]
+        offset = self.audio_offset if companion_source is None else companion_offset
+        backend_cfg = self.cfg if companion_source is None else self.consumer_dee
         identity = {"backend": self.atmos_backend_identity,
-                    "source_sha256": self._file_hash(self.audio_source),
-                    "samples": round(duration * 48000), "offset_samples": round(self.audio_offset * 48000)}
+                    "source_sha256": self._file_hash(source),
+                    "samples": round(duration * 48000), "offset_samples": round(offset * 48000)}
         stored = self.manifest.get("atmos_audio") or {}
         if stored and stored.get("identity") != identity:
             raise PipelineError("Atmos 输入、混音或编码器配置已改变，请新建任务以避免复用错误音轨")
-        if "audio" in self.manifest["completed"]:
-            if not output.is_file() or self.manifest.get("audio_sha256") != self._file_hash(output):
+        if stage in self.manifest["completed"]:
+            if not output.is_file() or self.manifest.get(hash_field) != self._file_hash(output):
                 raise PipelineError("生成的 Atmos 缓存已改变，请新建任务")
             check = validate_atmos_audio(self._inspect(output, audio_only=True), duration)
             if check["status"] != "pass":
                 raise PipelineError("Atmos 缓存未通过复核：" + check["summary"])
             return output
         master = folder / "master.wav"
-        channels = 16 if self.cfg.get("atmos_backend") == "aws" else 10
+        channels = 16 if backend_cfg.get("atmos_backend") == "aws" else 10
         if "atmos_master" in self.manifest["completed"]:
             if not master.is_file() or stored.get("master_sha256") != self._file_hash(master):
                 raise PipelineError("空间音频母版缓存已改变，请新建任务")
@@ -917,8 +1042,8 @@ class Pipeline:
                 raise PipelineError("工作盘空间不足以保存空间音频母版，请清理空间或选择其他工作盘")
             partial_master = folder / "master.partial.wav"
             try:
-                mix = prepare_master(find_tool("ffmpeg"), self.audio_source, self.audio_stream,
-                                     duration, partial_master, self._run, channels, audio_offset=self.audio_offset)
+                mix = prepare_master(find_tool("ffmpeg"), source, stream, duration, partial_master,
+                                     self._run, channels, audio_offset=offset)
             except AtmosError as exc:
                 raise PipelineError(str(exc)) from exc
             info = self._inspect(partial_master, audio_only=True)
@@ -937,7 +1062,7 @@ class Pipeline:
                 raise PipelineError("Atmos 编码缓存已改变，未继续封装")
         else:
             try:
-                if self.cfg.get("atmos_backend") == "aws":
+                if backend_cfg.get("atmos_backend") == "aws":
                     from atmos_cloud import CloudAtmosConfig, encode_atmos_cloud, CloudAtmosCancelled, CloudAtmosError
                     cloud_output = folder / "downloaded.mp4"
                     try:
@@ -949,7 +1074,7 @@ class Pipeline:
                         raise PipelineError(str(exc)) from exc
                     encoded = cloud_output
                 else:
-                    encoded, evidence = encode_dee(self.cfg, master, folder, self._run)
+                    encoded, evidence = encode_dee(backend_cfg, master, folder, self._run)
             except AtmosError as exc:
                 raise PipelineError(str(exc)) from exc
             self._run([find_tool("ffmpeg"), "-nostdin", "-v", "warning", "-y", "-i", encoded,
@@ -968,14 +1093,14 @@ class Pipeline:
         self._boundary()
         # Keep the validated encoded cache for resume; publish only a local copy.
         shutil.copyfile(encoded_cache, output)
-        self.manifest["audio_sha256"] = self._file_hash(output)
-        self._stage_done("audio")
+        self.manifest[hash_field] = self._file_hash(output)
+        self._stage_done(stage)
         self.progress(90)
         return output
 
-    def _audio_payload_hash(self, path):
+    def _audio_payload_hash(self, path, ordinal=0):
         result = self._run([find_tool("ffmpeg"), "-nostdin", "-v", "error", "-i", path,
-                            "-map", "0:a:0", "-c:a", "copy", "-f", "hash", "-hash", "sha256", "-"])
+                            "-map", f"0:a:{ordinal}", "-c:a", "copy", "-f", "hash", "-hash", "sha256", "-"])
         found = re.search(r"SHA256=([0-9a-f]{64})", result, re.I)
         if not found:
             raise PipelineError("无法核对最终音频码流是否原样封装")
@@ -986,6 +1111,9 @@ class Pipeline:
         # The temporary final output stays on the output volume for atomic publication.
         partial = self.output.with_name(f".{self.output.stem}.{self.manifest['job_id']}.partial.mp4")
         cmd = [find_tool("ffmpeg"), "-nostdin", "-v", "warning", "-y"]
+        denoised = bool(self.manifest.get("ai_denoise", {}).get("applied"))
+        music_sr = self.manifest.get("music_sr") or {}
+        extended = bool(music_sr.get("applied"))
         if self.cfg["route"] != "preserve" and self.cfg["color_mode"] in ("dv81", "dv84"):
             cmd += ["-fflags", "+genpts", "-r", str(self.rate)]
         if self.cfg["route"] == "preserve":
@@ -999,21 +1127,30 @@ class Pipeline:
         cmd += ["-i", video]
         if audio:
             audio_offset = self.audio_offset + self.manifest.get("audio_trimmed_preroll_seconds", 0.0)
-            if self.cfg["audio_mode"] in ("copy", "atmos_auto") and not self._generate_atmos and audio_offset:
+            copy_audio = self.free_audio["action"] == "copy" if self.free_audio else self.cfg["audio_mode"] in ("copy", "atmos_auto")
+            if copy_audio and not (denoised or extended or self._generate_atmos) and audio_offset:
                 # Each separate audio input is normalized by FFmpeg on reading;
                 # restore its original position on the source video's timeline.
                 cmd += ["-itsoffset", f"{audio_offset:.9f}"]
             cmd += ["-i", audio]
+        if self.companion_audio:
+            if self.companion_offset:
+                cmd += ["-itsoffset", f"{self.companion_offset:.9f}"]
+            cmd += ["-i", self.companion_audio]
         mapping = f"0:{self.info['stream']['index']}" if self.cfg["route"] == "preserve" else "0:v:0"
         cmd += ["-map", mapping]
         if audio:
             cmd += ["-map", "1:a:0"]
+        if self.companion_audio:
+            cmd += ["-map", "2:a:0", "-disposition:a:0", "default", "-disposition:a:1", "0"]
         cmd += ["-c", "copy"]
         if self.cfg["route"] != "preserve" or self.info["stream"]["codec_name"] == "hevc":
             cmd += ["-tag:v", "hvc1"]
         elif self.info["stream"]["codec_name"] == "h264":
             cmd += ["-tag:v", "avc1"]
         cmd += ["-movflags", "+faststart", "-strict", "unofficial", partial]
+        if self.free_audio and (self.free_audio["action"] in ("alac", "pcm", "stereo_master") or denoised or extended):
+            cmd[-1:-1] = ["-movie_timescale", str(music_sr["sample_rate"] if extended else self.free_audio["sample_rate"])]
         if self.cfg["delivery"] == "bilibili":
             cmd[-1:-1] = ["-map_metadata", "-1", "-map_chapters", "-1"]
         if self.cfg["route"] != "preserve" and self.cfg["color_mode"] in ("dv81", "dv84"):
@@ -1037,15 +1174,60 @@ class Pipeline:
             # Read the complete video through the decoder. A valid container or
             # successful mux alone does not prove there are no corrupt frames.
             self._run([find_tool("ffmpeg"), "-nostdin", "-v", "error", "-xerror", "-i", partial,
-                       "-map", "0:v:0", "-map", "0:a:0?", "-f", "null", "-"])
+                       "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"])
             if self.manifest.get("dolby_analysis"):
                 self._verify_final_rpu(partial)
+            elif self.cfg["route"] == "preserve" and self.cfg.get("bili_one_click") and self.info.get("dv_profile"):
+                video_stream = next(stream for stream in data["streams"] if stream["codec_type"] == "video")
+                self._verify_final_rpu(partial, int(video_stream.get("nb_read_packets") or 0))
             from quality import assess_bilibili, validate_atmos_audio
             media = self._inspect(partial)
             media["path"] = str(self.output)
             media["filename"] = self.output.name
             media["format"]["filename"] = str(self.output)
-            readiness = assess_bilibili(media, require_atmos=self.cfg["require_atmos"])
+            free_audio = None
+            if self.free_audio:
+                from hires_audio import verify_hires_audio, HiresAudioError
+                free_audio = dict(self.free_audio, retained_atmos=False, platform_verified=False)
+                if extended:
+                    from music_sr import verify_sr_output
+                    verify_sr_output(media["audio_streams"][0], music_sr)
+                    free_audio.update(action="music_sr", output_codec=music_sr["output_codec"],
+                                      output_bits=music_sr["output_bits"], output_sample_rate=music_sr["sample_rate"],
+                                      eligible=False, detail=music_sr["detail"])
+                if denoised:
+                    from ai_audio import verify_ai_audio
+                    decision = self.manifest["ai_denoise"]
+                    checked = verify_ai_audio(find_tool("ffmpeg"), partial, media["audio_streams"][0],
+                                              self.free_audio, decision, expected, self._run)
+                    decision.update(checked)
+                    free_audio.update(action="denoise", output_codec="alac", output_bits=16,
+                                      eligible=False, detail=decision["detail"])
+                if free_audio["action"] in ("alac", "pcm"):
+                    try:
+                        evidence = verify_hires_audio(find_tool("ffmpeg"), self.audio_source, partial,
+                                                      media["audio_streams"][0], self.free_audio, expected,
+                                                      self.audio_offset, self._run)
+                    except HiresAudioError as exc:
+                        raise PipelineError(str(exc)) from exc
+                    free_audio.update(evidence)
+                else:
+                    if media["audio_codec"] != free_audio["output_codec"]:
+                        raise PipelineError("免费模式输出音频编码与计划不符")
+                    payload = self._audio_payload_hash(audio)
+                    if payload != self._audio_payload_hash(partial):
+                        raise PipelineError("最终封装改变了音频码流")
+                    free_audio.update(mux_payload_sha256=payload, mux_payload_verified=True,
+                                      retained_atmos=free_audio["action"] == "copy" and media["atmos"] == "confirmed" and media["audio_codec"] == "eac3")
+                    if free_audio["retained_atmos"]:
+                        free_audio["detail"] = "已免费保留源 E-AC-3 JOC / Atmos 音轨；未重新编码"
+                self.manifest["free_audio"] = free_audio
+            readiness = assess_bilibili(media, require_atmos=self.cfg["require_atmos"], free_audio=free_audio)
+            if self.cfg["bili_one_click"]:
+                from consumer_audio import verify_delivery
+                consumer = verify_delivery(self, partial, media, free_audio, find_tool("ffmpeg"))
+                self.manifest["consumer_audio"] = consumer
+                readiness["summary"] = consumer["detail"] + "。平台标识待 B 站转码确认"
             if self.cfg["require_atmos"] or self.cfg["audio_mode"] == "atmos_auto":
                 audio_check = validate_atmos_audio(media, expected if self._generate_atmos else None,
                                                    strict_sample_rate=self._generate_atmos)
@@ -1067,7 +1249,11 @@ class Pipeline:
                                 "decode_verified": True, "source": self.cfg["video"]}
             if self.manifest.get("rpu_validation"):
                 report["export"]["rpu_validation"] = self.manifest["rpu_validation"]
-            for key in ("hdr_remaster", "dolby_analysis", "rpu_final_validation", "atmos_audio"):
+            if self.cfg["bili_one_click"] and self.cfg.get("picture_plan"):
+                report["export"]["picture_plan"] = self.cfg["picture_plan"]
+            for key in ("hdr_remaster", "dolby_analysis", "rpu_final_validation", "atmos_audio", "free_audio", "ai_denoise", "music_sr", "consumer_audio", "video_super_resolution"):
+                if key == "atmos_audio" and self.cfg["bili_one_click"] and not self.companion_audio:
+                    continue
                 if self.manifest.get(key):
                     report["export"][key] = self.manifest[key]
             if self.cfg["delivery"] == "bilibili" and report["status"] == "fail":
@@ -1113,7 +1299,8 @@ class Pipeline:
             raise PipelineError(str(exc)) from exc
 
     def _validate_copy(self, path):
-        data = _json_command([find_tool("ffprobe"), "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)])
+        count = ["-count_packets"] if self.cfg.get("bili_one_click") and self.info.get("dv_profile") else []
+        data = _json_command([find_tool("ffprobe"), "-v", "error", *count, "-show_streams", "-show_format", "-of", "json", str(path)])
         video = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), None)
         source = self.info["stream"]
         if not video or any(video.get(k) != source.get(k) for k in ("codec_name", "width", "height", "pix_fmt")):
@@ -1124,7 +1311,7 @@ class Pipeline:
         for original in source.get("side_data_list", []):
             if original.get("side_data_type") == "DOVI configuration record":
                 final = next((d for d in video.get("side_data_list", []) if d.get("side_data_type") == "DOVI configuration record"), {})
-                if any(original.get(k) != final.get(k) for k in ("dv_profile", "dv_bl_signal_compatibility_id", "rpu_present_flag")):
+                if any(original.get(k) != final.get(k) for k in ("dv_profile", "dv_level", "dv_bl_signal_compatibility_id", "rpu_present_flag")):
                     raise PipelineError("原片杜比配置未完整保留")
         # Hash the encoded video payload, rather than trusting stream tags.
         def digest(file, mapping):
@@ -1138,7 +1325,7 @@ class Pipeline:
             raise PipelineError("视频码流校验不一致，未发布输出")
         return data
 
-    def _native_filters(self):
+    def _native_filters(self, *, sr_rgb=False):
         """Keep native precision until the final 10-bit quantization."""
         stream, mode = self.info["stream"], self.cfg["color_mode"]
         transfer = stream.get("color_transfer") if self.cfg["source_transfer_override"] == "auto" else self.cfg["source_transfer_override"]
@@ -1153,14 +1340,34 @@ class Pipeline:
         if stream.get("pix_fmt", "").startswith(("rgb", "bgr", "gbr")):
             matrix = "gbr"
         value_range = "full" if stream.get("color_range") == "pc" or matrix == "gbr" else "limited"
+        if sr_rgb:
+            # The model receives full-range sRGB from the decoded SDR programme.
+            transfer, primaries, matrix, value_range = "iec61966-2-1", "bt709", "gbr", "full"
         out_t = "arib-std-b67" if mode in ("hlg", "dv84") else ("smpte2084" if mode in ("hdr10", "dv81") else "bt709")
         out_p = "bt709" if mode == "sdr" else "bt2020"
         out_m = "bt709" if mode == "sdr" else "bt2020nc"
         cfg = self.cfg
-        filters = f"setpts=PTS-STARTPTS,fps={self.rate},"
+        filters = "setpts=PTS-STARTPTS,"
+        cadence = f"fps={self.rate},"
+        if cfg.get("bili_one_click"):
+            from consumer_picture import cadence_filter
+            cadence = cadence_filter(cfg.get("picture_plan", {}), self.rate, self.info["duration"])
+        if sr_rgb:
+            cadence = ""  # Input PNGs already carry the complete target cadence.
+            filters += "format=gbrp,"
+        plan = cfg.get("picture_plan", {}) if cfg.get("bili_one_click") else {}
+        # Upscale after interpolation and HDR conversion. Motion estimation runs
+        # on actual source pixels; the final resize operates on the 10-bit frame.
+        # New plans include the picture rectangle separately from the 8K canvas.
+        # Older jobs stored only the final size for their upscale.
+        resize_delivery = (bool(plan.get("active_size")) and plan.get("resize") != "native"
+                           or plan.get("resize") == "upscale")
+        after_resize = plan.get("method") == "motion_interpolation" and not resize_delivery
+        if not after_resize:
+            filters += cadence
         visual_width = self.info.get("display_width", stream["width"])
         visual_height = self.info.get("display_height", stream["height"])
-        if (cfg['width'], cfg['height']) != (visual_width, visual_height):
+        if not resize_delivery and (cfg['width'], cfg['height']) != (visual_width, visual_height):
             try:
                 sar = Fraction(stream.get("sample_aspect_ratio", "1:1").replace(":", "/"))
                 if sar <= 0:
@@ -1174,6 +1381,8 @@ class Pipeline:
             fitted_h = max(2, min(cfg['height'], int(cfg['width'] / dar)) // 2 * 2)
             filters += (f"scale={fitted_w}:{fitted_h}:flags=lanczos,setsar=1,"
                         f"pad={cfg['width']}:{cfg['height']}:(ow-iw)/2:(oh-ih)/2,")
+        if after_resize:
+            filters += cadence
         same_color = transfer == out_t and primaries == out_p and matrix == out_m
         self.manifest["hdr_remaster"] = {"active": False, "source_transfer": transfer,
                                         "reason": "HDR 源保持原动态范围" if hdr else "未启用 SDR 高光扩展"}
@@ -1191,6 +1400,11 @@ class Pipeline:
             filters += (f"zscale=pin={primaries}:tin=linear:min=gbr:rin=full:"
                         f"p={out_p}:t={out_t}:m={out_m}:r=limited:npl=100:dither=error_diffusion,format=yuv420p10le")
         self.manifest["hdr_remaster"]["source_transfer_interpretation"] = interpretation
+        if resize_delivery:
+            w, h = plan.get("active_size") or (cfg["width"], cfg["height"])
+            filters += f",zscale=w={w}:h={h}:filter=lanczos,setsar=1"
+            if (w, h) != (cfg["width"], cfg["height"]):
+                filters += f",pad={cfg['width']}:{cfg['height']}:(ow-iw)/2:(oh-ih)/2:color=black"
         # Source RPU metadata must never follow regraded/resampled frames into
         # the encoder. Only explicitly supplied matching metadata is injected.
         if not same_color:
@@ -1209,18 +1423,35 @@ class Pipeline:
             transfer = "arib-std-b67" if mode in ("hlg", "dv84") else ("smpte2084" if mode in ("hdr10", "dv81") else "bt709")
             primaries, matrix = ("bt709", "bt709") if mode == "sdr" else ("bt2020", "bt2020nc")
             params = f"repeat-headers=1:frame-threads=1:bframes=0:colorprim={primaries}:transfer={transfer}:colormatrix={matrix}"
-            cmd = [find_tool("ffmpeg"), "-nostdin", "-v", "warning", "-y", "-i", self.cfg["video"],
-                   "-map", f"0:{self.info['stream']['index']}", "-vf", self._native_filters(),
-                   "-c:v", "libx265", "-preset", self.cfg.get("preset", "medium"), "-crf", str(self.cfg.get("crf", 18)),
+            opts = ["-c:v", "libx265", "-preset", self.cfg.get("preset", "medium"), "-crf", str(self.cfg.get("crf", 18)),
                    "-pix_fmt", "yuv420p10le", "-x265-params", params,
                    "-tag:v", "hvc1", "-video_track_timescale", str(self.rate.numerator), "-an", partial]
             if any(s.get("side_data_type") == "DOVI configuration record" for s in self.info["stream"].get("side_data_list", [])):
                 help_text = self._run([find_tool("ffmpeg"), "-hide_banner", "-h", "encoder=libx265"])
                 if "-dolbyvision" in help_text:
-                    cmd[-1:-1] = ["-dolbyvision", "0"]
-            self._run(cmd, cwd=self.job_dir)
-            data = self._validate_video(partial)
+                    opts[-1:-1] = ["-dolbyvision", "0"]
+            sr_report = {}
+            if self.cfg.get("bili_one_click") and self.cfg.get("picture_plan", {}).get("sr_method") == "realesrgan_x4plus":
+                from video_sr import render, InferenceUnavailable
+                self.stage("1/6 Real-ESRGAN 画面超分与编码", 1, 6)
+                try:
+                    sr_report = render(self, find_tool("ffmpeg"), TOOLS_DIR, opts)
+                except InferenceUnavailable as exc:
+                    self._boundary()
+                    sr_report = {"applied": False, "detail": f"{exc}，本次使用高精度缩放"}
+                self.manifest["video_super_resolution"] = sr_report
+                self.log("[画面] " + sr_report["detail"])
+            if not sr_report.get("applied"):
+                cmd = [find_tool("ffmpeg"), "-nostdin", "-v", "warning", "-y", "-i", self.cfg["video"],
+                       "-map", f"0:{self.info['stream']['index']}", "-vf", self._native_filters(), *opts]
+                self._run(cmd, cwd=self.job_dir)
+            expected = None
+            if self.cfg.get("bili_one_click") and self.cfg.get("picture_plan", {}).get("method") == "motion_interpolation":
+                expected = max(1, round(Fraction(str(self.info["duration"])) * self.rate))
+            data = self._validate_video(partial, count=expected)
             video = next(s for s in data["streams"] if s["codec_type"] == "video")
+            if sr_report.get("applied") and int(video["nb_read_frames"]) != sr_report["encoded_frames"]:
+                raise PipelineError("AI 超分后的编码帧数与已处理的帧数不一致")
             self.manifest["output_frames"] = int(video["nb_read_frames"])
             self.manifest["duration"] = self.manifest["output_frames"] / float(self.rate)
             self.manifest["fps"] = str(self.rate)
@@ -1273,6 +1504,9 @@ class Pipeline:
                 chunks = self._encode_batches(frames)
                 video = self._join(chunks)
             audio = self._audio()
+            if self.cfg["bili_one_click"]:
+                from consumer_audio import prepare_companion
+                prepare_companion(self, audio, find_tool("ffmpeg"))
             output = self._mux(video, audio)
             checkpoint = self.root / "checkpoint.json"
             if checkpoint.exists():

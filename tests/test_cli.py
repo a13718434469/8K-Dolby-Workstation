@@ -161,6 +161,48 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertRegex(result.stderr, "音轨|Atmos")
         self.assertFalse(self.output.exists())
 
+    def test_free_mode_requires_sound_and_rejects_cloud_options(self):
+        result = self.cli("--audio-mode", "hires")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("音轨", result.stderr)
+        for options in (("--require-atmos",), ("--atmos-backend", "aws", "--allow-cloud-upload"),
+                        ("--auto-double-dolby",), ("--audio-mode", "aac")):
+            with self.subTest(options=options):
+                result = self.cli("--auto-free", *options)
+                self.assertEqual(result.returncode, 2)
+        self.assertFalse(self.output.exists())
+
+    def test_free_mode_matches_sound_to_source_without_claiming_an_upgrade(self):
+        for codec, rate, output_codec, eligible, suffix in (
+                ("pcm_s24le", "96000", "alac", True, "wav"),
+                ("pcm_s16le", "44100", "alac", False, "wav"),
+                ("aac", "48000", "aac", False, "m4a")):
+            with self.subTest(codec=codec):
+                external = self.root / f"master-{codec}.{suffix}"
+                final = self.root / f"final-{codec}.mp4"
+                run_command([FFMPEG, "-v", "error", "-f", "lavfi", "-i",
+                             f"aevalsrc=0.1*sin(2*PI*410*t)|0.08*sin(2*PI*330*t):s={rate}:d=0.2",
+                             "-c:a", codec, external])
+                result = self.cli("--audio-mode", "hires", "--audio", str(external), output=final)
+                self.assertEqual(result.returncode, 0, result.stderr + result.stdout[-1500:])
+                self.assertEqual(video_hash(self.source), video_hash(final))
+                report = json.loads(Path(str(final) + ".quality.json").read_text(encoding="utf-8"))
+                self.assertEqual(report["media"]["audio_codec"], output_codec)
+                self.assertEqual(report["media"]["audio_sample_rate"], int(rate))
+                audio = report["export"]["free_audio"]
+                self.assertIs(audio["eligible"], eligible)
+                self.assertFalse(audio["retained_atmos"])
+                self.assertFalse(report["platform_verified"])
+
+    @unittest.skipUnless(os.environ.get("DOLBY_ATMOS_FIXTURE") and DOVI, "existing local JOC fixture and Dolby tools needed")
+    def test_auto_free_preserves_real_joc_without_an_encoder(self):
+        result = self.cli("--auto-free", "--audio", os.environ["DOLBY_ATMOS_FIXTURE"], "--preset", "ultrafast")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout[-1500:])
+        report = json.loads(Path(str(self.output) + ".quality.json").read_text(encoding="utf-8"))
+        self.assertIs(report["export"]["free_audio"]["retained_atmos"], True)
+        self.assertFalse(report["export"]["free_audio"]["eligible"])
+        self.assertEqual(report["media"]["dv_compatibility"], 4)
+
     def test_bili_delivery_rejects_ordinary_sdr_without_relabelling_it(self):
         original = video_hash(self.source)
         result = self.cli("--delivery", "bilibili")
