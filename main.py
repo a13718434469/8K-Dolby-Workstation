@@ -252,7 +252,7 @@ class ProcessThread(QThread):
 
 class MainWindow(QMainWindow):
     PRESETS = {
-        "bili_hires": ("免费 · 杜比视界 + 原音质", "音频全程在本机处理。已有合规 Atmos 可直接保留，Hi-Res 无损母带可保留原有精度。有损素材按实际音质导出。"),
+        "bili_hires": ("免费 · 杜比视界与音频", "选择声音处理方式。已有 Atmos 与高解析无损母带优先保留。"),
         "bili_dual": ("双杜比 · 要求 Atmos", "制作 Dolby Vision 8.4 和真正的 Atmos 音轨。已有合规码流直接保留；普通音轨通过已配置的 Atmos 编码器制作。成片严格检查两种格式，平台双标仍需投稿后验收。"),
         "preserve": ("原片保留（不重新编码）", "不重编码视频，保持原始分辨率、帧率和色彩。"),
         "bili_preserve": ("B站杜比 · 保留原片", "保留已有 Dolby Vision 8.4 与原始码流。优先保障画质，有现成 Atmos 就原样保留。"),
@@ -421,9 +421,13 @@ class MainWindow(QMainWindow):
             self.export_preset.addItem(label, key)
         export.addWidget(QLabel("导出方案"))
         export.addWidget(self.export_preset)
-        self.ai_denoise = QCheckBox("AI 人声降噪")
-        self.ai_denoise.setToolTip("适合带风扇声、底噪的对白录音。音乐建议关闭。无损母带、Atmos 和多声道沿用原音。")
-        export.addWidget(self.ai_denoise)
+        self.sound_label = QLabel("声音处理")
+        self.sound_treatment = SafeComboBox()
+        self.sound_treatment.addItem("保留原音", "original")
+        self.sound_treatment.addItem("AI 音质增强 · 补充高频细节", "music_sr")
+        self.sound_treatment.addItem("人声降噪 · 减轻对白底噪", "denoise")
+        export.addWidget(self.sound_label)
+        export.addWidget(self.sound_treatment)
         self.automatic_summary = QLabel("添加视频后自动检查格式。\n通常无需调整设置，直接开始处理。")
         self.smart_summary = self.automatic_summary
         self.automatic_summary.setObjectName("automaticSummary")
@@ -724,7 +728,7 @@ class MainWindow(QMainWindow):
         self.rpu_mode.currentIndexChanged.connect(self.update_control_states)
         self.rpu.changed.connect(self.rpu_selected)
         self.audio_mode.currentIndexChanged.connect(self.audio_mode_selected)
-        self.ai_denoise.toggled.connect(self.ai_denoise_changed)
+        self.sound_treatment.currentIndexChanged.connect(self.sound_treatment_changed)
         self.atmos_backend.currentIndexChanged.connect(self.atmos_settings_changed)
         self.dee_path.changed.connect(self.atmos_settings_changed)
         self.dee_profile.changed.connect(self.atmos_settings_changed)
@@ -745,6 +749,9 @@ class MainWindow(QMainWindow):
             self.apply_preset()
             self._preset_explicit = False
             self._audio_mode_explicit = False
+            from music_sr_backend import model_ready
+            if model_ready():
+                self.select_data(self.sound_treatment, "music_sr")
         self.advanced_toggle.setChecked(False)
         self.set_compatible_audio()
         self.atmos_settings_changed()
@@ -905,6 +912,13 @@ class MainWindow(QMainWindow):
                 if not ai_skip_reason(plan) and not self.audio_ai_model_ready():
                     return needs("audio_ai_model", "请安装人声降噪模型",
                                  "请在工作站目录运行 setup.bat -CoreOnly -WithAudioAI。也可以先关闭“AI 人声降噪”导出原音。",
+                                 "模型安装说明…")
+            if cfg.get("music_sr"):
+                from music_sr import sr_skip_reason
+                from music_sr_backend import model_ready
+                if not sr_skip_reason(plan) and not model_ready():
+                    return needs("audio_ai_model", "请安装音质增强模型",
+                                 "在工作站目录运行 .\\.venv\\Scripts\\python.exe music_sr_backend.py，然后重新开始。",
                                  "模型安装说明…")
             return None
         if cfg.get("audio_mode") not in ("atmos_auto", "copy"):
@@ -1111,15 +1125,22 @@ class MainWindow(QMainWindow):
         if required:
             self.atmos_status.setText(self.atmos_backend_status().get("message", "尚未配置 Atmos 编码器"))
 
-    def ai_denoise_changed(self):
+    def sound_treatment_changed(self):
         self.update_audio_hint()
+        self.refresh_start_state()
         if self.vinfo and not self.last_output:
             self.render_source_quality()
 
     def free_audio_plan(self, info):
         from hires_audio import choose_free_audio_stream
         _, plan = choose_free_audio_stream((info or {}).get("audio_streams") or [])
-        if self.export_preset.currentData() == "bili_hires" and self.ai_denoise.isChecked():
+        treatment = self.sound_treatment.currentData() if self.export_preset.currentData() == "bili_hires" else "original"
+        if treatment == "music_sr":
+            from music_sr import sr_skip_reason
+            reason = sr_skip_reason(plan)
+            plan["detail"] = (plan["detail"] + "。" + reason if reason else
+                              f"已选 {plan['codec'].upper()} 音轨，将检测带宽并用本机 AI 补充缺失的高频细节")
+        if treatment == "denoise":
             from ai_audio import ai_skip_reason
             reason = ai_skip_reason(plan)
             if reason:
@@ -1396,7 +1417,8 @@ class MainWindow(QMainWindow):
             "hdr_peak_nits": self._hdr_peak_nits,
             "source_transfer_override": self.source_transfer.currentData() if route != "preserve" else "auto",
             "audio_mode": self.audio_mode.currentData(), "auto_clean": self.clean.isChecked(),
-            "ai_denoise": self.export_preset.currentData() == "bili_hires" and self.ai_denoise.isChecked(),
+            "ai_denoise": self.export_preset.currentData() == "bili_hires" and self.sound_treatment.currentData() == "denoise",
+            "music_sr": self.export_preset.currentData() == "bili_hires" and self.sound_treatment.currentData() == "music_sr",
             "preset": self.encoding_preset.currentData(), "crf": self.crf.value(),
             "batch_size": self.batch_size.value(), "require_atmos": self.export_preset.currentData() == "bili_dual" or self.audio_mode.currentData() == "atmos_auto",
         }
@@ -1456,7 +1478,9 @@ class MainWindow(QMainWindow):
         route = self.current_route()
         running = self.worker is not None
         self.update_atmos_visibility()
-        self.ai_denoise.setVisible(self.export_preset.currentData() == "bili_hires")
+        self.sound_label.setVisible(self.export_preset.currentData() == "bili_hires")
+        self.sound_treatment.setVisible(self.export_preset.currentData() == "bili_hires")
+        self.sound_treatment.setEnabled(not running)
         self.audio_mode.setEnabled(self.export_preset.currentData() != "bili_hires" and not running)
         for control in (self.resolution, self.fps, self.color):
             control.setEnabled(route != "preserve" and not running)
@@ -1658,9 +1682,10 @@ class MainWindow(QMainWindow):
         free_audio = report.get("export", {}).get("free_audio") or {}
         if free_audio.get("detail") and not any(c.get("detail") == free_audio["detail"] for c in chosen):
             details.insert(0, free_audio["detail"])
-        denoise = report.get("export", {}).get("ai_denoise") or {}
-        if denoise.get("detail") and not any(denoise["detail"] in line for line in details):
-            details.insert(0, denoise["detail"])
+        effects = report.get("export", {})
+        treatment = effects.get("music_sr") or effects.get("ai_denoise") or {}
+        if treatment.get("detail") and not any(treatment["detail"] in line for line in details):
+            details.insert(0, treatment["detail"])
         bili = report.get("bilibili_readiness")
         if isinstance(bili, dict):
             readiness = {"pass": "符合公开指引的本地技术条件", "warning": "存在待确认事项", "fail": "尚不符合杜比 8.4 条件"}.get(bili.get("status"), "待检查")
@@ -1775,7 +1800,8 @@ class MainWindow(QMainWindow):
             self.ai.setChecked(cfg.get("ai", False))
             self.interp.setChecked(cfg.get("interp", False))
             self.clean.setChecked(cfg.get("auto_clean", True))
-            self.ai_denoise.setChecked(cfg.get("ai_denoise") is True)
+            self.select_data(self.sound_treatment, "music_sr" if cfg.get("music_sr") else
+                             "denoise" if cfg.get("ai_denoise") else "original")
             self.crf.setValue(int(cfg.get("crf", 18)))
             self.batch_size.setValue(int(cfg.get("batch_size", 32)))
             self._audio_mode_explicit = True
@@ -2045,7 +2071,7 @@ class MainWindow(QMainWindow):
         data = {key: cfg[key] for key in keys}
         data.update({"version": 2, "export_preset": self.export_preset.currentData(),
                      "resolution": self.resolution.currentData(), "fps": self.fps.currentData(),
-                     "ai_denoise": self.ai_denoise.isChecked()})
+                     "sound_treatment": self.sound_treatment.currentData()})
         data.update(self.atmos_config())
         # Upload/cost consent is deliberately a per-application-session choice.
         data["cloud_atmos"]["allow_upload"] = False
@@ -2082,7 +2108,8 @@ class MainWindow(QMainWindow):
             self.crf.setValue(data.get("crf", 18))
             self.batch_size.setValue(data.get("batch_size", 32))
             self.clean.setChecked(data.get("auto_clean", True))
-            self.ai_denoise.setChecked(data.get("ai_denoise") is True)
+            self.select_data(self.sound_treatment, data.get("sound_treatment") or
+                             ("denoise" if data.get("ai_denoise") is True else "original"))
             self._preset_explicit = not migrate
             self._audio_mode_explicit = not migrate and "audio_mode" in data
             self.update_control_states()

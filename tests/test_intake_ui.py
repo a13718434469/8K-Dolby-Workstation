@@ -320,8 +320,8 @@ def free_audio_track_selection(w):
 def opt_in_ai_denoise(w):
     from unittest.mock import patch
     w.load_whole()
-    assert w.ai_denoise.isVisible() and not w.config()['ai_denoise']
-    toggle_checkbox_with_space(w.ai_denoise)
+    assert w.sound_treatment.isVisible() and not w.config()['ai_denoise']
+    w.select_data(w.sound_treatment, 'denoise')
     assert w.config()['ai_denoise'] and '减轻对白底噪' in w.audio_hint.text()
     assert '减轻对白底噪' in w.quality_details.text()
     with patch('install_audio_model.MODEL_PATH', fixture / 'missing.rnnn'):
@@ -334,9 +334,9 @@ def opt_in_ai_denoise(w):
     saved = w.config()
     w.save_preferences()
     w.select_data(w.export_preset, 'bili_dual')
-    assert not w.ai_denoise.isVisible() and not w.config()['ai_denoise']
+    assert not w.sound_treatment.isVisible() and not w.config()['ai_denoise']
     w.restore_config(saved)
-    assert w.ai_denoise.isVisible() and w.config()['ai_denoise']
+    assert w.sound_treatment.isVisible() and w.config()['ai_denoise']
     del saved['ai_denoise']
     w.restore_config(saved)
     assert not w.config()['ai_denoise'], 'legacy jobs must use the original soundtrack'
@@ -346,6 +346,28 @@ def opt_in_ai_denoise(w):
     assert 'Hi-Res' in w.audio_hint.text() and '跳过 AI 人声降噪' in w.audio_hint.text()
     with patch('install_audio_model.MODEL_PATH', fixture / 'missing.rnnn'):
         assert w.audio_readiness(w.config()) is None
+
+
+def music_restoration_selection(w):
+    from unittest.mock import patch
+    w.load_whole()
+    w.select_data(w.sound_treatment, 'music_sr')
+    cfg = w.config()
+    assert cfg['music_sr'] and not cfg['ai_denoise']
+    assert '高频细节' in w.audio_hint.text()
+    with patch('music_sr_backend.model_ready', return_value=False):
+        w.refresh_start_state()
+        assert w.start.text() == '模型安装说明…' and 'music_sr_backend.py' in w.start.toolTip()
+    w.save_preferences()
+    w.select_data(w.sound_treatment, 'denoise')
+    assert w.config()['ai_denoise'] and not w.config()['music_sr']
+    w.restore_config(cfg)
+    assert w.sound_treatment.currentData() == 'music_sr'
+    w.select_data(w.sound_treatment, 'original')
+    assert w.load_preferences() and w.sound_treatment.currentData() == 'music_sr'
+    assert w.drop([fixture / 'two tracks.mka'], target=w.audio)[0]
+    with patch('music_sr_backend.model_ready', return_value=False):
+        assert w.audio_readiness(w.config()) is None and 'Hi-Res' in w.audio_hint.text()
 
 
 def reject_multiple_video(w):
@@ -949,6 +971,7 @@ scenarios = {
     'audio_container': audio_only_container, 'restore': replace_and_restore,
     'audio_from_video': audio_from_video_section, 'free_tracks': free_audio_track_selection,
     'ai_denoise': opt_in_ai_denoise,
+    'music_restoration': music_restoration_selection,
     'multiple_video': reject_multiple_video,
     'invalid_atomic': reject_invalid_atomically, 'output': automatic_and_user_output,
     'async': asynchronous_validation, 'processing': processing_locks_intake,
@@ -1084,6 +1107,9 @@ class IntakeUiTests(unittest.TestCase):
 
     def test_ai_denoise_opt_in_preserves_masters_and_legacy_jobs(self):
         self.scenario("ai_denoise")
+
+    def test_music_restoration_choice_and_compatible_track_readiness(self):
+        self.scenario("music_restoration")
 
     def test_multiple_video_drop_explains_rejection_and_keeps_source(self):
         self.scenario("multiple_video")

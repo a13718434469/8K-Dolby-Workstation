@@ -4,6 +4,7 @@ param(
     [switch]$CoreOnly,
     [switch]$WithDovi,
     [switch]$WithAudioAI,
+    [switch]$WithMusicSR,
     [switch]$SkipDownloads,
     [switch]$SkipPython,
     [switch]$VerifyOnly
@@ -177,6 +178,14 @@ function Invoke-WorkstationSetup {
         Write-Host ("Ready: {0}" -f $definition.Name) -ForegroundColor Green
     }
     Test-FFmpegInstallation -ToolsDir $toolsDir -RequireDovi
+    if ($WithMusicSR -or (-not $SkipPython -and -not $SkipDownloads -and -not $VerifyOnly)) {
+        $modelPython = Join-Path $baseDir '.venv/Scripts/python.exe'
+        if (-not (Test-Path -LiteralPath $modelPython)) { $modelPython = (Get-Command python -ErrorAction Stop).Source }
+        $modelOpts = @()
+        if ($SkipDownloads -or $VerifyOnly) { $modelOpts = @('--verify-only') }
+        & $modelPython (Join-Path $baseDir 'music_sr_backend.py') @modelOpts
+        if ($LASTEXITCODE -ne 0) { throw 'Music super-resolution model installation or verification failed.' }
+    }
     if ($WithAudioAI) {
         $modelPython = Join-Path $baseDir '.venv/Scripts/python.exe'
         if (-not (Test-Path -LiteralPath $modelPython)) { $modelPython = (Get-Command python -ErrorAction Stop).Source }

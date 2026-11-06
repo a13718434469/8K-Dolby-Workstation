@@ -17,6 +17,7 @@ def main(argv=None):
     parser.add_argument("--auto-double-dolby", action="store_true", help="自动制作杜比视界 8.4 + 真正 Atmos；普通音轨需要已配置的 Atmos 编码器，不允许降级为普通音频")
     parser.add_argument("--auto-free", action="store_true", help="免费本地制作杜比视界 8.4；保留现成 Atmos、无损母版或普通原声音质，不使用云编码")
     parser.add_argument("--ai-denoise", action="store_true", help="免费模式可选：用本地神经网络减轻普通单/双声道对白中的噪声")
+    parser.add_argument("--music-sr", action="store_true", help="用本地模型补充带宽不足的音乐和视频原声的高频细节")
     ai = parser.add_mutually_exclusive_group()
     ai.add_argument("--ai", action="store_true", help="增强路线主动启用 Real-ESRGAN")
     ai.add_argument("--no-ai", action="store_true", help="禁用 Real-ESRGAN（默认）")
@@ -75,6 +76,8 @@ def main(argv=None):
                 parser.error("--auto-dolby、--auto-double-dolby 与 --auto-free 请选择一个")
             if args.ai_denoise and not (args.auto_free or args.audio_mode == "hires"):
                 parser.error("--ai-denoise 需配合 --auto-free 或 --audio-mode hires")
+            if args.music_sr and (args.ai_denoise or not (args.auto_free or args.audio_mode == "hires")):
+                parser.error("--music-sr 需配合 --auto-free 或 --audio-mode hires；人声降噪应另选")
             if args.auto_free and "--audio-mode" in explicit and args.audio_mode != "hires":
                 parser.error("--auto-free 使用本地音频策略；请省略 --audio-mode 或使用 hires")
             if (args.auto_free or args.audio_mode == "hires") and (args.require_atmos or args.allow_cloud_upload):
@@ -143,7 +146,8 @@ def main(argv=None):
                    "ai": args.ai, "interp": args.interp, "target_fps": fps or source["fps_fraction"],
                    "width": width, "height": height, "color_mode": color, "rpu": args.rpu,
                    "work_width": work_width, "work_height": work_height,
-                   "audio_mode": audio_mode, "ai_denoise": args.ai_denoise, "model": args.model, "batch_size": args.batch_size,
+                   "audio_mode": audio_mode, "ai_denoise": args.ai_denoise, "music_sr": args.music_sr,
+                   "model": args.model, "batch_size": args.batch_size,
                    "preset": args.preset, "crf": args.crf, "auto_clean": not args.keep_temp,
                    "workspace": args.workspace}
             if audio_mode == "atmos_auto":

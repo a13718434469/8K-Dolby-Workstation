@@ -1,4 +1,4 @@
-# 8K Dolby Workstation 2.6
+# 8K Dolby Workstation 2.7
 
 用于视频检查、原片保留、高精度转码和可选 AI 增强的本地工作站。桌面与命令行共用处理核心，输出经过解码和格式检查后才保存为正式文件。
 
@@ -28,7 +28,11 @@
 
 ### 免费制作与 Hi-Res 投稿
 
-**有底噪的对白**可以在免费方案里勾选“AI 人声降噪”。工作站会在本机运行 RNNoise 模型，压低人声之间的风扇声等背景噪声。适用于普通有损单声道和立体声录音。它会保留部分原声，处理结果按源采样率保存为 16-bit ALAC。适合保留音乐、环境气氛或原有混音时，让该选项保持关闭。无损母版、Atmos 和多声道素材沿用原音轨处理方案。
+**想改善发闷的音乐或视频原声**，在免费方案的“声音处理”里选择“AI 音质增强 · 补充高频细节”。工作站检测源音轨的有效频带，用本地 NovaSR 模型预测高频，只把推测的高频成分加入原声，并保留左右声道。符合条件时输出 48 kHz、16-bit ALAC，报告注明 AI 重制。这一处理适用于单声道和立体声的带限素材；完整频带、高解析无损母带和现成 Atmos 等按检测结果保留。高频是估算值，效果可通过同音量试听判断。[NovaSR 作者的模型说明与音乐示例](https://huggingface.co/YatharthS/NovaSR)
+
+常规 Windows 安装会准备音质增强模型。已有环境可运行 `.\.venv\Scripts\python.exe music_sr_backend.py` 安装，附加 `--verify-only` 只做本地校验。命令行在 `--auto-free` 或 `--audio-mode hires` 后添加 `--music-sr`。程序在本机处理音频，在输出前校验声道、样本数与最终封装。
+
+**有底噪的对白**可在“声音处理”里另选“人声降噪 · 减轻对白底噪”。工作站会在本机运行 RNNoise 模型，压低人声之间的风扇声等背景噪声。适用于普通有损单声道和立体声录音。它会保留部分原声，处理结果按源采样率保存为 16-bit ALAC。
 
 首次使用 AI 降噪可运行 `setup.bat -CoreOnly -WithAudioAI`。已有环境只需运行 `.\.venv\Scripts\python.exe install_audio_model.py` 安装约 298 KB 的模型；`--verify-only` 可离线校验模型。命令行在 `--auto-free` 或 `--audio-mode hires` 后添加 `--ai-denoise`。程序只在安装时从作者的固定版本下载模型并核对 SHA-256，之后可离线处理。参见 [RNNoise 模型来源](https://github.com/GregorR/rnnoise-models/tree/3eee541a283fd3b8f81b85b1748e3b9ccbefa04d/somnolent-hogwash-2018-09-01) 与 [FFmpeg arnndn 滤镜](https://ffmpeg.org/ffmpeg-filters.html#arnndn)。
 

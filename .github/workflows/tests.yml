@@ -76,6 +76,11 @@ jobs:
           python install_audio_model.py
           python install_audio_model.py --verify-only
           python -m unittest discover -s tests -p test_ai_audio.py -v
+      - name: Test music super-resolution with the official model
+        run: |
+          python music_sr_backend.py
+          python music_sr_backend.py --verify-only
+          python -m unittest discover -s tests -p "test_music_sr*.py" -v
       - name: Test automatic Dolby analysis and desktop delivery
         env:
           QT_QPA_PLATFORM: offscreen
