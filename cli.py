@@ -15,6 +15,7 @@ def main(argv=None):
     parser.add_argument("--delivery", choices=("general", "bilibili"), default="general")
     parser.add_argument("--auto-dolby", action="store_true", help="自动制作 B站杜比视界 8.4；合规原片直接保留，其他素材自动分析生成元数据（4K60以内）")
     parser.add_argument("--auto-double-dolby", action="store_true", help="自动制作杜比视界 8.4 + 真正 Atmos；普通音轨需要已配置的 Atmos 编码器，不允许降级为普通音频")
+    parser.add_argument("--auto-free", action="store_true", help="免费本地制作杜比视界 8.4；保留现成 Atmos、无损母版或普通原声音质，不使用云编码")
     ai = parser.add_mutually_exclusive_group()
     ai.add_argument("--ai", action="store_true", help="增强路线主动启用 Real-ESRGAN")
     ai.add_argument("--no-ai", action="store_true", help="禁用 Real-ESRGAN（默认）")
@@ -31,7 +32,7 @@ def main(argv=None):
     parser.add_argument("--hdr-peak-nits", type=int, choices=range(100, 1001), metavar="100..1000", help="SDR 自动 HDR 制作的峰值亮度，默认 600 nits")
     parser.add_argument("--source-transfer", choices=("auto", "bt709", "arib-std-b67", "smpte2084"), help="源动态范围解释：自动、SDR BT.709、HLG 或 PQ；缺少 BT.2020 动态范围标记时需明确选择")
     parser.add_argument("--audio", default="", help="可选外部音频")
-    parser.add_argument("--audio-mode", choices=("atmos_auto", "copy", "aac", "eac3", "none"), default="copy")
+    parser.add_argument("--audio-mode", choices=("hires", "atmos_auto", "copy", "aac", "eac3", "none"), default="copy")
     parser.add_argument("--require-atmos", action="store_true", help="仅在最终文件确认包含真正 Atmos 时成功")
     parser.add_argument("--atmos-backend", choices=("dee", "aws"), default="dee", help="Atmos 编码后端；默认本地已授权 DEE")
     parser.add_argument("--dee-path", default="", help="完整 DEE 编码程序路径")
@@ -50,7 +51,7 @@ def main(argv=None):
     parser.add_argument("--workspace", default=str(WORKSPACE))
     parser.add_argument("--resume", action="store_true", help="使用工作目录中原任务的完整参数恢复")
     args = parser.parse_args(argv)
-    auto_picture = args.auto_dolby or args.auto_double_dolby
+    auto_picture = args.auto_dolby or args.auto_double_dolby or args.auto_free
     supplied = list(argv if argv is not None else sys.argv[1:])
     explicit = {token.split("=", 1)[0] for token in supplied if token.startswith("-")}
     try:
@@ -69,8 +70,12 @@ def main(argv=None):
         else:
             if not args.input:
                 parser.error("新任务需要 --input")
-            if args.auto_dolby and args.auto_double_dolby:
-                parser.error("--auto-dolby 与 --auto-double-dolby 请选择一个")
+            if sum((args.auto_dolby, args.auto_double_dolby, args.auto_free)) > 1:
+                parser.error("--auto-dolby、--auto-double-dolby 与 --auto-free 请选择一个")
+            if args.auto_free and "--audio-mode" in explicit and args.audio_mode != "hires":
+                parser.error("--auto-free 使用本地音频策略；请省略 --audio-mode 或使用 hires")
+            if (args.auto_free or args.audio_mode == "hires") and (args.require_atmos or args.allow_cloud_upload):
+                parser.error("本地免费模式不使用云编码，也不强制生成 Atmos")
             if auto_picture and explicit & {"--route", "--delivery", "--color"}:
                 parser.error("自动制作模式选择路线、B站交付和杜比 8.4；请勿同时指定 --route / --delivery / --color")
             if args.auto_double_dolby and "--audio-mode" in explicit and args.audio_mode != "atmos_auto":
@@ -106,7 +111,7 @@ def main(argv=None):
             route, delivery = args.route, args.delivery
             fps = args.fps
             color = args.color
-            audio_mode = "atmos_auto" if args.auto_double_dolby else args.audio_mode
+            audio_mode = "hires" if args.auto_free else "atmos_auto" if args.auto_double_dolby else args.audio_mode
             if auto_picture:
                 suitable = assess_bilibili(source).get("status") != "fail"
                 unchanged = not (args.size or fps or args.rpu or args.rpu_mode == "external" or args.source_transfer not in (None, "auto"))
@@ -118,7 +123,7 @@ def main(argv=None):
                     width, height = max(2, int(width * scale) // 2 * 2), max(2, int(height * scale) // 2 * 2)
                 if Fraction(str(fps or source["fps_fraction"])) > 60:
                     fps = "60"
-                if "--audio-mode" not in explicit and not args.auto_double_dolby:
+                if "--audio-mode" not in explicit and not (args.auto_double_dolby or args.auto_free):
                     audio = inspect_audio(args.audio) if args.audio else source
                     if audio.get("audio_codec", "none") not in ("none", "aac", "ac3", "eac3", "mp3", "alac"):
                         audio_mode = "aac"

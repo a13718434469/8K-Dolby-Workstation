@@ -553,7 +553,7 @@ def validate_atmos_audio(info, expected_duration=None, *, strict_sample_rate=Tru
     return {"status": status, "checks": checks, "summary": summary}
 
 
-def assess_bilibili(info, require_atmos=False):
+def assess_bilibili(info, require_atmos=False, *, free_audio=None):
     """Assess the published Dolby Vision upload profile, never platform approval."""
     checks = []
     codec = str(info.get("codec_name", "unknown")).lower()
@@ -592,7 +592,16 @@ def assess_bilibili(info, require_atmos=False):
     checks.append(_check("bitrate_guidance", "码率参考", "pass" if bitrate >= 30_000_000 else "warning",
                          (f"检测到约 {bitrate / 1_000_000:.2f} Mbps；官方建议约 30 Mbps。码率不是画质或平台通过的保证"
                           if bitrate else "无法确定视频码率；官方建议约 30 Mbps，需结合画面复杂度和肉眼检查")))
-    checks.extend(_atmos_audio_checks(info, require_atmos=require_atmos))
+    sources = [dict(item) for item in SOURCES]
+    if free_audio is None or require_atmos or free_audio.get("retained_atmos"):
+        checks.extend(_atmos_audio_checks(info, require_atmos=require_atmos))
+    if free_audio is not None:
+        eligible = bool(free_audio.get("eligible"))
+        sources.append({"title": "哔哩哔哩：稿件 Hi-Res 无损音频投稿须知",
+                        "url": "https://www.bilibili.com/blackboard/activity-m1vS5T9l2t.html"})
+        checks.append(_check("free_audio", "免费方案 · 实际音轨",
+                             "pass" if eligible or free_audio.get("retained_atmos") else "warning",
+                             free_audio["detail"]))
     failed = any(item["status"] == "fail" for item in checks)
     warned = any(item["status"] == "warning" for item in checks)
     status = "fail" if failed else "warning" if warned else "pass"
@@ -602,9 +611,11 @@ def assess_bilibili(info, require_atmos=False):
         summary = "本地杜比视界关键格式符合公开指引，仍有交付提示；平台识别尚未验收"
     else:
         summary = "本地格式检查通过；平台识别尚未验收"
+    if free_audio is not None and not failed:
+        summary = free_audio["detail"] + "。B站标识待投稿转码后确认"
     return {"schema_version": 1, "status": status, "summary": summary, "checks": checks,
             "platform_verified": False, "require_atmos": bool(require_atmos),
-            "sources": [dict(item) for item in SOURCES], "guidance_note": GUIDANCE_NOTE}
+            "sources": sources, "guidance_note": GUIDANCE_NOTE}
 
 
 def validate_expectations(info, expected):
