@@ -6,14 +6,49 @@ from pathlib import Path
 from quality import assess_bilibili
 
 
+def supports_8k_dolby_level(stream, width, height, rate):
+    # FFmpeg's Dolby Vision level table allows 7680-wide images from level 11.
+    # The level 11 pixel rate is equivalent to 8K30; level 12 allows 8K60.
+    pixel_rate = width * height * rate
+    if width <= 3840 and pixel_rate <= 3840 * 2160 * 120:
+        return True
+    record = next((d for d in stream.get("side_data_list", [])
+                   if d.get("side_data_type") == "DOVI configuration record"), {})
+    required = 12 if pixel_rate > 7680 * 4320 * 30 else 11
+    return required <= (record.get("dv_level") or 0) <= 13
+
+
+def _delivery_size(source):
+    """Return the oriented 8K canvas and the aspect-preserving active picture."""
+    width = int(source.get("display_width") or source["width"])
+    height = int(source.get("display_height") or source["height"])
+    if min(width, height) <= 0:
+        raise ValueError("无法读取源画面尺寸")
+    try:
+        sar = Fraction(str(source.get("stream", {}).get("sample_aspect_ratio") or "1:1").replace(":", "/"))
+        if sar <= 0:
+            sar = Fraction(1)
+    except (ValueError, ZeroDivisionError):
+        sar = Fraction(1)
+    if source.get("rotation") in (90, 270):
+        sar = 1 / sar
+    display_w, display_h = width * sar, Fraction(height)
+    factor = min(7680 / max(display_w, display_h), 4320 / min(display_w, display_h))
+    active = tuple(max(2, 2 * round(side * factor / 2)) for side in (display_w, display_h))
+    canvas = (7680, 4320) if display_w >= display_h else (4320, 7680)
+    return canvas, active
+
+
 def plan_picture(source):
     rate = Fraction(str(source["fps_fraction"]))
     if rate <= 0:
         raise ValueError("源视频缺少有效帧率，请选择可正常播放的原视频")
     width = int(source.get("display_width") or source["width"])
     height = int(source.get("display_height") or source["height"])
-    scale = min(1.0, 3840 / max(width, height), 2160 / min(width, height))
-    w, h = (max(2, int(v * scale) // 2 * 2) for v in (width, height))
+    (w, h), active = _delivery_size(source)
+    padded = active != (w, h)
+    resized = (w, h) != (width, height) or padded
+    upscale = resized and active[0] * active[1] > width * height
     stream = source.get("stream", {})
     transfer = source.get("color_transfer", "unknown")
     wide = source.get("color_primaries") == "bt2020" or source.get("color_space") in ("bt2020nc", "bt2020c")
@@ -29,7 +64,8 @@ def plan_picture(source):
     motion_input = source.get("bit_depth") == 8 and pix_fmt in (
         "yuv420p", "yuv422p", "yuv444p", "yuvj420p", "yuvj422p", "yuvj444p", "nv12", "nv21")
     target = rate / ceil(rate / 60) if rate > 60 else rate
-    suitable = (not interlaced and scale == 1 and rate <= 60
+    suitable = (not interlaced and not resized and rate <= 60
+                and supports_8k_dolby_level(stream, source["width"], source["height"], rate)
                 and assess_bilibili(source)["status"] != "fail")
     route = "preserve" if suitable else "transcode"
     method = "keep"
@@ -53,11 +89,20 @@ def plan_picture(source):
         detail = "源视频帧间隔不规则，按原平均节奏制作"
     elif hdr or (source.get("bit_depth") or 0) > 8:
         detail = "沿用原帧率，保留高精度画面后制作杜比视界"
-    elif 20 <= rate <= 30 and motion_input and w >= 64 and h >= 48:
+    elif 20 <= rate <= 30 and motion_input and width >= 64 and height >= 48:
         target = rate * 2
         method = "motion_interpolation"
         detail = "按运动轨迹生成中间帧，切镜时保持剪辑边界"
+    if resized:
+        detail += f"；源画面 {width}×{height}，等比{'放大' if upscale else '缩放'}至 {active[0]}×{active[1]}"
+        if padded:
+            detail += f"，居中补黑边至 {w}×{h}"
+        if source.get("dv_profile"):
+            detail += "，按新画面重新生成杜比元数据"
     plan = {"method": method, "source_fps": str(rate), "output_fps": str(target),
+            "source_size": [width, height], "output_size": [w, h],
+            "active_size": list(active),
+            "resize": "upscale" if upscale else "fit" if resized else "native",
             "detail": error or detail}
     if error:
         plan["error"] = error
@@ -89,7 +134,7 @@ def make_job(source_info, video, output=None, audio="", workspace=None):
 
 
 def cadence_filter(plan, rate, duration):
-    """Filter after any resize, before high-precision tone/color processing."""
+    """Generate the target cadence before color conversion and UHD upscaling."""
     method = plan.get("method")
     if method == "motion_interpolation":
         # minterpolate needs neighboring frames. Supply its lookahead at EOF

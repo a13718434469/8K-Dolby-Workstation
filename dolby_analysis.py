@@ -1,4 +1,4 @@
-"""Independent CPU Profile 8.4 measurements; not Dolby's proprietary analysis.
+"""Independent Profile 8.4 measurements; not Dolby's proprietary analysis.
 
 The actual installed dovi_tool supplies the polynomial/MMR/DM composer. Native
 4:2:0 is composed before chroma upsampling. Pixel processing holds one raw frame
@@ -396,6 +396,15 @@ def analyze_video(ffmpeg, video, workdir, expected_frames, *, dovi_tool, profile
         _command([dovi_tool, "generate", "-j", template_cfg, "-p", "8.4", "-o", template_rpu], cancel_check)
         template = _json(_command([dovi_tool, "info", "-i", template_rpu, "-f", "0"], cancel_check))
         composer = Profile84Composer(template)
+        meter = None
+        gpu_frames = 0
+        if width * height >= 3840 * 2160 and os.environ.get("DOLBY_FORCE_CPU_ANALYSIS") != "1":
+            # Driver availability and FP64 numerical agreement are checked per job.
+            try:
+                from dolby_opencl import verified_meter
+                meter = verified_meter(composer, measure_frame)
+            except Exception:
+                meter = None
         config_path, stats_path = job / "generator.json", job / "measurements.jsonl"
         config_partial, stats_partial = job / "generator.json.partial", job / "measurements.jsonl.partial"
         expected_digest, count, changed, previous = hashlib.sha256(), 0, 0, None
@@ -419,7 +428,19 @@ def analyze_video(ffmpeg, video, workdir, expected_frames, *, dovi_tool, profile
                         y = plane[:pixels].reshape(height, width)
                         cb = plane[pixels:pixels + pixels // 4].reshape(height // 2, width // 2)
                         cr = plane[pixels + pixels // 4:].reshape(height // 2, width // 2)
-                        result = measure_frame(y, cb, cr, composer, chroma_location=location, cancel_check=cancel_check)
+                        measured = None
+                        if meter is not None:
+                            try:
+                                measured = meter.stats(y, cb, cr, location)
+                            except Exception:
+                                # Recover even from a device reset without dropping this frame.
+                                meter = None
+                        if measured is None:
+                            result = measure_frame(y, cb, cr, composer, chroma_location=location, cancel_check=cancel_check)
+                        else:
+                            gpu_frames += 1
+                            codes = {k: quantize_pq(v) for k, v in measured.items()}
+                            result = {"measured_pq": measured, "measured_l1": codes, "encoded_l1": clamp_l1(**codes)}
                         encoded = result["encoded_l1"]
                         sequence = tuple(encoded[k] for k in ("min_pq", "max_pq", "avg_pq"))
                         expected_digest.update(struct.pack(">HHH", *sequence))
@@ -449,7 +470,10 @@ def analyze_video(ffmpeg, video, workdir, expected_frames, *, dovi_tool, profile
         report = {"schema_version": 1, "method": METHOD, "analysis_kind": "independent_public_standard_per_frame",
                   "dolby_algorithm_equivalent": False, "visual_match_verified": False, "platform_verified": False,
                   "source_sha256": source_hash, "source": str(video), "width": width, "height": height,
-                  "input_pixel_format": "yuv420p10le", "input_range": "tv", "arithmetic": "float64 tiled CPU",
+                  "input_pixel_format": "yuv420p10le", "input_range": "tv",
+                  "arithmetic": ("float64 OpenCL" if gpu_frames == count else
+                                 "float64 OpenCL and CPU" if gpu_frames else "float64 tiled CPU"),
+                  "gpu_measured_frames": gpu_frames, "cpu_measured_frames": count - gpu_frames,
                   "frames": count, "all_frames_measured": True, "full_resolution": True,
                   "composer_sha256": composer.fingerprint, "composer_source": version + " generate -p 8.4",
                   "composer_input_normalization": "code / 2^BL_bit_depth (10-bit /1024)",

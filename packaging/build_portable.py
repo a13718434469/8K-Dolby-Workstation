@@ -29,14 +29,14 @@ MODEL_SHA = "e255c76b227f16f7f392cc43677c38bd2c5aa129f042a2ba3eb03fb29e470c7a"
 APP_FILES = (
     "consumer_app.py", "consumer_audio.py", "consumer_picture.py", "pipeline.py", "quality.py", "app_identity.py", "cli.py", "dolby_analysis.py",
     "hdr_remaster.py", "hires_audio.py", "atmos_cloud.py", "atmos_encoding.py", "flashsr_official.py",
-    "ai_audio.py", "install_audio_model.py", "music_sr.py", "music_sr_backend.py",
+    "ai_audio.py", "install_audio_model.py", "music_sr.py", "music_sr_backend.py", "dolby_opencl.py",
     "assets/app.svg", "LICENSE", "README.md", "DOLBY_ANALYSIS_NOTICE.md", "NOVASR_NOTICE.txt", "FLASHSR_NOTICE.txt",
     "main.py", "ATMOS_SETUP.md", "requirements.txt", "run.bat", "setup.bat", "setup.ps1",
 )
 PACKAGES = (
     "numpy", "onnxruntime", "boto3", "botocore", "s3transfer", "python-dateutil", "jmespath", "six", "urllib3",
     "PyQt5", "PyQt5-Qt5", "PyQt5-sip", "coloredlogs", "humanfriendly", "flatbuffers", "packaging",
-    "protobuf", "sympy", "mpmath",
+    "protobuf", "sympy", "mpmath", "pyopencl", "pytools", "platformdirs", "siphash24", "typing_extensions",
 )
 QT_MODULES = {"__init__.py", "QtCore.pyd", "QtGui.pyd", "QtWidgets.pyd", "QtSvg.pyd", "sip.pyd"}
 QT_DLLS = {x + ".dll" for x in (

@@ -1,9 +1,16 @@
 # Independent Dolby Vision analysis
 
-`dolby_analysis.py` implements an independent CPU measurement method, not Dolby's
+`dolby_analysis.py` implements an independent measurement method, not Dolby's
 proprietary CM analysis or certification. The installed dovi_tool supplies the
 actual Profile 8.4 polynomial/MMR/DM coefficients. A generic HLG OOTF is never
 substituted for this composer.
+
+For UHD and 8K frames, the optional OpenCL backend uses the same FP64 equations,
+native chroma siting, spatial reduction and quantization. It checks the local
+driver against the NumPy reference at startup. Unsupported hardware and driver
+errors fall back to the CPU. Set `DOLBY_FORCE_CPU_ANALYSIS=1` to force the
+reference path. Each analysis report records the number of frames measured by
+each backend.
 
 References:
 

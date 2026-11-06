@@ -102,7 +102,7 @@ class ExportThread(QThread):
                 else:
                     sound = "本次制作主音轨。素材未含可用 Atmos，本机也未配置全景声编码服务。"
                 self.plan_text.emit(plan["detail"] + "。\n" + sound)
-                self.stage_text.emit(f"{Path(video).name}　·　{plan['source_fps']} → {plan['output_fps']} fps")
+                self.stage_text.emit(f"{Path(video).name}　·　{cfg['width']} × {cfg['height']}　·　{plan['output_fps']} fps")
                 def stage(name, *_):
                     if plan["method"] == "motion_interpolation" and name.startswith("1/"):
                         self.stage_text.emit(f"正在生成中间帧并编码画面　·　目标 {plan['output_fps']} fps")
@@ -128,6 +128,10 @@ def result_lines(report):
     audio = report.get("export", {}).get("consumer_audio", {})
     picture = (f"杜比视界 8.4　·　{media.get('width', '?')} × {media.get('height', '?')}　·　"
                f"{float(media.get('fps') or 0):g} fps") if (media.get("dv_profile"), media.get("dv_compatibility")) == (8, 4) else "画面已保存"
+    plan = report.get("export", {}).get("picture_plan", {})
+    if plan.get("resize") == "upscale" and plan.get("source_size"):
+        sw, sh = plan["source_size"]
+        picture += f"（由 {sw} × {sh} 放大）"
     lines = [picture]
     if audio.get("atmos"):
         lines.append("杜比全景声　·　已校验 Atmos 音轨")
@@ -173,14 +177,14 @@ class SubmissionWindow(QMainWindow):
         body = QVBoxLayout(panel)
         body.setContentsMargins(38, 28, 38, 28)
         body.setSpacing(12)
-        self.heading = QLabel("制作 B站投稿视频")
+        self.heading = QLabel("制作 8K 杜比视界视频")
         self.heading.setObjectName("heading")
         body.addWidget(self.heading)
         self.message = QLabel("将视频拖到这里，即可自动生成投稿 MP4。")
         self.message.setWordWrap(True)
         self.message.setTextFormat(Qt.PlainText)
         body.addWidget(self.message)
-        self.detail = QLabel("自动处理画面和帧率，根据素材制作或保留音轨。")
+        self.detail = QLabel("横屏输出 7680 × 4320，竖屏输出 4320 × 7680。声轨根据素材自动处理。")
         self.detail.setWordWrap(True)
         self.detail.setTextFormat(Qt.PlainText)
         self.detail.setObjectName("detail")
@@ -270,11 +274,11 @@ class SubmissionWindow(QMainWindow):
     def reset_idle(self):
         self.exported = None
         self.soundtrack = ""
-        self.heading.setText("制作 B站投稿视频")
+        self.heading.setText("制作 8K 杜比视界视频")
         self.primary.setText("选择视频并生成")
         self.add_sound.setText("添加独立音轨…")
         self.folder.hide()
-        self.detail.setText("自动处理画面和帧率，根据素材制作或保留音轨。")
+        self.detail.setText("横屏输出 7680 × 4320，竖屏输出 4320 × 7680。声轨根据素材自动处理。")
         self.message.setText("将视频拖到这里，即可自动生成投稿 MP4。")
 
     def dragEnterEvent(self, event):

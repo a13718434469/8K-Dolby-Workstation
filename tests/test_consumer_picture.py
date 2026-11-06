@@ -1,5 +1,7 @@
 from fractions import Fraction
 from pathlib import Path
+import json
+import os
 import shutil
 import subprocess
 import tempfile
@@ -18,6 +20,30 @@ def source(rate="24", **changes):
 
 
 class ConsumerPictureTests(unittest.TestCase):
+    def test_plan_fits_hd_into_8k_in_display_orientation(self):
+        cases = [
+            ({"width": 1280, "height": 720}, [7680, 4320]),
+            ({"width": 1920, "height": 1080}, [7680, 4320]),
+            ({"width": 720, "height": 1280}, [4320, 7680]),
+            ({"width": 1440, "height": 1080}, [5760, 4320]),
+            ({"width": 1920, "height": 800}, [7680, 3200]),
+            ({"width": 1440, "height": 1080, "display_width": 1080, "display_height": 1440,
+              "rotation": 90, "stream": {"sample_aspect_ratio": "4:3"}}, [4320, 7680]),
+            ({"width": 720, "height": 480}, [6480, 4320]),
+            ({"width": 3840, "height": 2160}, [7680, 4320]),
+            ({"width": 7680, "height": 4320}, [7680, 4320]),
+        ]
+        for changes, active in cases:
+            with self.subTest(changes=changes):
+                p = plan_picture(source(**changes))
+                output = [4320, 7680] if active[0] < active[1] else [7680, 4320]
+                self.assertEqual([p["width"], p["height"]], output)
+                self.assertEqual(p["picture_plan"]["output_size"], output)
+                self.assertEqual(p["picture_plan"]["active_size"], active)
+                self.assertEqual(p["picture_plan"]["source_size"],
+                                 [changes.get("display_width", changes["width"]),
+                                  changes.get("display_height", changes["height"])])
+
     def test_native_cadence_and_hdr_safety(self):
         for fps, expected in [("24000/1001", "48000/1001"), ("24", "48"), ("25", "50"),
                               ("30000/1001", "60000/1001"), ("30", "60")]:
@@ -34,12 +60,21 @@ class ConsumerPictureTests(unittest.TestCase):
                          "deinterlace_fields")
 
     def test_compatible_dv_is_preserved_and_ambiguous_sources_are_actionable(self):
-        p = plan_picture(source(codec_name="hevc", bit_depth=10, pix_fmt="yuv420p10le",
-                                color_transfer="arib-std-b67", color_space="bt2020nc", color_primaries="bt2020",
-                                container="mov,mp4,m4a,3gp,3g2,mj2", dv_profile=8, dv_compatibility=4,
-                                dv_rpu_present=True, dv_bl_present=True, dv_el_present=False))
+        dv = source(width=7680, height=4320, codec_name="hevc", bit_depth=10, pix_fmt="yuv420p10le",
+                    color_transfer="arib-std-b67", color_space="bt2020nc", color_primaries="bt2020",
+                    container="mov,mp4,m4a,3gp,3g2,mj2", dv_profile=8, dv_compatibility=4,
+                    dv_rpu_present=True, dv_bl_present=True, dv_el_present=False,
+                    stream={"side_data_list": [{"side_data_type": "DOVI configuration record", "dv_level": 11}]})
+        p = plan_picture(dv)
         self.assertEqual(p["route"], "preserve")
         self.assertEqual(p["picture_plan"]["method"], "preserve")
+        self.assertEqual(plan_picture(dict(dv, fps_fraction="48", fps=48))["route"], "transcode")
+        p = plan_picture(dict(dv, width=1280, height=720))
+        self.assertEqual(p["route"], "transcode")
+        self.assertEqual(p["picture_plan"]["resize"], "upscale")
+        self.assertEqual(p["rpu_mode"], "auto")
+        self.assertEqual(p["color_mode"], "dv84")
+        self.assertNotIn("fps_override", p)
         with self.assertRaisesRegex(ValueError, "HLG"):
             make_job(source(color_transfer="unknown", color_primaries="bt2020"), "in.mp4", "out.mp4")
         with tempfile.TemporaryDirectory() as temp:
@@ -66,6 +101,35 @@ class ConsumerPictureTests(unittest.TestCase):
         self.assertEqual(processed[::2], original)
         novel = [x for i, x in enumerate(processed[1:-1:2]) if x not in (original[i], original[i+1])]
         self.assertGreater(len(novel), 15)
+
+    @unittest.skipUnless(os.environ.get("DOLBY_RUN_8K_SMOKE") == "1", "opt in to short 8K Dolby encode")
+    def test_hd_input_actually_exports_8k_10bit_dv_with_rebuilt_rpu(self):
+        from pipeline import Pipeline, find_tool
+        from quality import inspect_media
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            video, output = root / "hd.mkv", root / "uhd.mp4"
+            subprocess.run([find_tool("ffmpeg"), "-v", "error", "-f", "lavfi", "-i",
+                            "testsrc2=size=1280x720:rate=24", "-frames:v", "2", "-c:v", "ffv1",
+                            "-color_primaries", "bt709", "-colorspace", "bt709", "-color_trc", "bt709", str(video)],
+                           check=True, timeout=45)
+            cfg = make_job(inspect_media(video), video, output, workspace=root / "work")
+            cfg["preset"] = "ultrafast"
+            Pipeline(cfg).run()
+            rendered = inspect_media(output)
+            for key, expected in (("width", 7680), ("height", 4320), ("fps_fraction", "48"),
+                                  ("pix_fmt", "yuv420p10le"), ("dv_profile", 8), ("dv_compatibility", 4)):
+                self.assertEqual(rendered[key], expected, key)
+            dv = next(d for d in rendered["stream"]["side_data_list"] if d["side_data_type"] == "DOVI configuration record")
+            self.assertGreaterEqual(dv["dv_level"], 12)  # 8K48 pixel rate
+            report = json.loads(Path(str(output) + ".quality.json").read_text(encoding="utf-8"))
+            self.assertEqual(report["export"]["rpu_final_validation"]["l1_frames_verified"], 4)
+            copy = root / "8k-copy.mp4"
+            cfg = make_job(rendered, output, copy, workspace=root / "preserve")
+            self.assertEqual(cfg["route"], "preserve")
+            Pipeline(cfg).run()
+            copied = json.loads(Path(str(copy) + ".quality.json").read_text(encoding="utf-8"))
+            self.assertEqual(copied["export"]["rpu_final_validation"]["preserved_rpu_frames"], 4)
 
 
 if __name__ == "__main__":

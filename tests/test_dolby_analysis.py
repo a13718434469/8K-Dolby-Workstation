@@ -132,6 +132,30 @@ class ActualComposerTests(unittest.TestCase):
                 expected.append(min(1., max(0., value)))
             np.testing.assert_allclose(actual[component], expected, atol=2e-13)
 
+    def test_available_opencl_device_matches_encoded_l1_on_structured_pixels(self):
+        try:
+            import pyopencl as cl
+        except ImportError:
+            self.skipTest("Optional OpenCL binding unavailable")
+        try:
+            platforms = cl.get_platforms()
+        except cl.Error:
+            self.skipTest("No OpenCL platform")
+        if not any(d.double_fp_config and d.type & cl.device_type.GPU
+                   for p in platforms for d in p.get_devices()):
+            self.skipTest("No FP64 OpenCL GPU")
+        from dolby_opencl import verified_meter
+        meter = verified_meter(self.composer, analysis.measure_frame)
+        row = np.arange(384, dtype=np.uint16)
+        y = (np.arange(218, dtype=np.uint16)[:, None] * 5 + row[None, :]) % 1024
+        cb, cr = y[::2, ::2].copy(), np.flip(y[1::2, 1::2], axis=1).copy()
+        for location in ("left", "topleft"):
+            expected = analysis.measure_frame(y, cb, cr, self.composer, chroma_location=location)
+            actual = meter.stats(y, cb, cr, location)
+            self.assertEqual({k: analysis.quantize_pq(v) for k, v in actual.items()}, expected["measured_l1"])
+            for k in actual:
+                self.assertAlmostEqual(actual[k], expected["measured_pq"][k], places=10)
+
     def test_tile_sizes_do_not_change_native420_measurement(self):
         rng = np.random.default_rng(2026)
         y = rng.integers(64, 941, (48, 64), dtype=np.uint16)

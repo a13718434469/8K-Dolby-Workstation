@@ -20,7 +20,7 @@ BASE_DIR = Path(__file__).resolve().parent
 TOOLS_DIR = BASE_DIR / "tools"
 WORKSPACE = BASE_DIR / "workspace"
 CHECKPOINT_FILE = WORKSPACE / "checkpoint.json"
-VERSION = "3.0"
+VERSION = "3.1"
 
 
 class PipelineError(RuntimeError):
@@ -583,10 +583,11 @@ class Pipeline:
     def _rpu_file(self):
         return str(getattr(self, "rpu_path", None) or self.cfg["rpu"])
 
-    def _verify_final_rpu(self, video):
+    def _verify_final_rpu(self, video, preserved_frames=None):
         """Extract through a pipe: validate every final RPU without a second HEVC copy."""
         from dolby_analysis import verify_rpu
         folder = self.job_dir / "auto-dolby"
+        folder.mkdir(exist_ok=True)
         output = folder / "final-extracted.bin"
         log_path = folder / "final-extraction.log"
         output.unlink(missing_ok=True)
@@ -608,8 +609,19 @@ class Pipeline:
                     self._cancel.wait(0.05)
                 if decoder.poll() != 0 or extractor.poll() != 0:
                     raise PipelineError("最终杜比元数据提取失败，未发布成片")
-            self.manifest["rpu_final_validation"] = verify_rpu(find_tool("dovi_tool"), output,
-                self.manifest["dolby_analysis"], cancel_check=self._boundary)
+            if preserved_frames is None:
+                self.manifest["rpu_final_validation"] = verify_rpu(find_tool("dovi_tool"), output,
+                    self.manifest["dolby_analysis"], cancel_check=self._boundary)
+            else:
+                # The untouched HEVC stream is hashed in _validate_copy. Also
+                # prove the MP4's Dolby declaration is backed by a full RPU track.
+                summary = self._run([find_tool("dovi_tool"), "info", "-i", output, "-s"])
+                frames = re.search(r"Frames:\s*(\d+)", summary)
+                if (preserved_frames < 1 or not frames or int(frames[1]) != preserved_frames
+                        or not re.search(r"Profile:\s*8\b", summary)):
+                    raise PipelineError("原片的杜比元数据未覆盖成片的全部画面，未保存输出")
+                self.manifest["rpu_final_validation"] = {
+                    "preserved_rpu_frames": preserved_frames, "encoded_video_sha256_matches_source": True}
         finally:
             for process in (extractor, decoder):
                 if process is not None and process.poll() is None:
@@ -760,6 +772,10 @@ class Pipeline:
             compat = 4 if self.cfg["color_mode"] == "dv84" else 1
             if dv.get("dv_profile") != 8 or dv.get("dv_bl_signal_compatibility_id") != compat:
                 raise PipelineError("输出缺少所选 Dolby Vision Profile 配置；不会发布为杜比视界成功结果")
+            if self.cfg.get("bili_one_click"):
+                from consumer_picture import supports_8k_dolby_level
+                if not supports_8k_dolby_level(video, video["width"], video["height"], self.rate):
+                    raise PipelineError("杜比视界解码级别与成片尺寸或帧率不符，未保存输出")
         return data
 
     def _encode_batches(self, frames):
@@ -1161,6 +1177,9 @@ class Pipeline:
                        "-map", "0:v:0", "-map", "0:a?", "-f", "null", "-"])
             if self.manifest.get("dolby_analysis"):
                 self._verify_final_rpu(partial)
+            elif self.cfg["route"] == "preserve" and self.cfg.get("bili_one_click") and self.info.get("dv_profile"):
+                video_stream = next(stream for stream in data["streams"] if stream["codec_type"] == "video")
+                self._verify_final_rpu(partial, int(video_stream.get("nb_read_packets") or 0))
             from quality import assess_bilibili, validate_atmos_audio
             media = self._inspect(partial)
             media["path"] = str(self.output)
@@ -1280,7 +1299,8 @@ class Pipeline:
             raise PipelineError(str(exc)) from exc
 
     def _validate_copy(self, path):
-        data = _json_command([find_tool("ffprobe"), "-v", "error", "-show_streams", "-show_format", "-of", "json", str(path)])
+        count = ["-count_packets"] if self.cfg.get("bili_one_click") and self.info.get("dv_profile") else []
+        data = _json_command([find_tool("ffprobe"), "-v", "error", *count, "-show_streams", "-show_format", "-of", "json", str(path)])
         video = next((s for s in data.get("streams", []) if s.get("codec_type") == "video"), None)
         source = self.info["stream"]
         if not video or any(video.get(k) != source.get(k) for k in ("codec_name", "width", "height", "pix_fmt")):
@@ -1291,7 +1311,7 @@ class Pipeline:
         for original in source.get("side_data_list", []):
             if original.get("side_data_type") == "DOVI configuration record":
                 final = next((d for d in video.get("side_data_list", []) if d.get("side_data_type") == "DOVI configuration record"), {})
-                if any(original.get(k) != final.get(k) for k in ("dv_profile", "dv_bl_signal_compatibility_id", "rpu_present_flag")):
+                if any(original.get(k) != final.get(k) for k in ("dv_profile", "dv_level", "dv_bl_signal_compatibility_id", "rpu_present_flag")):
                     raise PipelineError("原片杜比配置未完整保留")
         # Hash the encoded video payload, rather than trusting stream tags.
         def digest(file, mapping):
@@ -1329,12 +1349,19 @@ class Pipeline:
         if cfg.get("bili_one_click"):
             from consumer_picture import cadence_filter
             cadence = cadence_filter(cfg.get("picture_plan", {}), self.rate, self.info["duration"])
-        after_resize = cfg.get("bili_one_click") and cfg.get("picture_plan", {}).get("method") == "motion_interpolation"
+        plan = cfg.get("picture_plan", {}) if cfg.get("bili_one_click") else {}
+        # Upscale after interpolation and HDR conversion. Motion estimation runs
+        # on actual source pixels; the final resize operates on the 10-bit frame.
+        # New plans include the picture rectangle separately from the 8K canvas.
+        # Older jobs stored only the final size for their upscale.
+        resize_delivery = (bool(plan.get("active_size")) and plan.get("resize") != "native"
+                           or plan.get("resize") == "upscale")
+        after_resize = plan.get("method") == "motion_interpolation" and not resize_delivery
         if not after_resize:
             filters += cadence
         visual_width = self.info.get("display_width", stream["width"])
         visual_height = self.info.get("display_height", stream["height"])
-        if (cfg['width'], cfg['height']) != (visual_width, visual_height):
+        if not resize_delivery and (cfg['width'], cfg['height']) != (visual_width, visual_height):
             try:
                 sar = Fraction(stream.get("sample_aspect_ratio", "1:1").replace(":", "/"))
                 if sar <= 0:
@@ -1367,6 +1394,11 @@ class Pipeline:
             filters += (f"zscale=pin={primaries}:tin=linear:min=gbr:rin=full:"
                         f"p={out_p}:t={out_t}:m={out_m}:r=limited:npl=100:dither=error_diffusion,format=yuv420p10le")
         self.manifest["hdr_remaster"]["source_transfer_interpretation"] = interpretation
+        if resize_delivery:
+            w, h = plan.get("active_size") or (cfg["width"], cfg["height"])
+            filters += f",zscale=w={w}:h={h}:filter=lanczos,setsar=1"
+            if (w, h) != (cfg["width"], cfg["height"]):
+                filters += f",pad={cfg['width']}:{cfg['height']}:(ow-iw)/2:(oh-ih)/2:color=black"
         # Source RPU metadata must never follow regraded/resampled frames into
         # the encoder. Only explicitly supplied matching metadata is injected.
         if not same_color:

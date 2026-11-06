@@ -1,8 +1,10 @@
-# B站投稿助手 3.0 / 8K Dolby Workstation
+# B站投稿助手 3.1 / 8K Dolby Workstation
 
 **Windows 用户打开完整便携包内的“B站投稿助手.exe”，拖入视频即开始制作。** 默认存入用户的“视频/B站投稿”，完成后可直接播放或打开文件夹。可随视频添加一条独立音轨。便携版附带运行时、FFmpeg、dovi_tool 和作者发布的 FlashSR 模型。开发者可用 `run.bat` 打开投稿助手，或用 `main.py` 打开高级工作站。
 
-适合的普通 SDR 素材会用 FFmpeg 运动补偿补帧，例如 24→48、25→50、30→60 fps，再按最终帧制作杜比视界 8.4。合规的现有杜比视界原片优先保留。对于有效带宽明显不足的单声道或立体声，助手会调用[作者发布的 FlashSR ONNX 模型](https://huggingface.co/YatharthS/FlashSR)重建高频，把新的 48 kHz / 24 bit ALAC 标为 AI 重制母版。已有高解析无损母带按原精度输出。
+**投稿助手默认制作 8K 杜比视界。** 横屏为 7680×4320，竖屏为 4320×7680。对不同宽高比的素材自动等比缩放并补边。较低分辨率的画面会注明放大来源，源素材决定能保留的真实细节。对于适合的 SDR，先做运动补帧（如 24→48、25→50、30→60 fps），再在最终画面上计算并验证逐帧杜比视界 8.4 元数据。合规的现成 8K 杜比原片可保留码流。高分辨率的逐帧分析优先使用通过数值自检的 FP64 OpenCL 显卡，其他机器自动使用 CPU。对于适合的单声道或立体声，助手调用[作者发布的 FlashSR ONNX 模型](https://huggingface.co/YatharthS/FlashSR)重建高频，把 48 kHz / 24 bit ALAC 标为 AI 重制母版。已有高解析无损母带按原精度输出。
+
+8K 与杜比视界在这里描述同一个 MP4 中的视频流。B 站提供的[8K 专题](https://www.bilibili.com/blackboard/activity-8Kweb.html)和[杜比视界投稿指南](https://www.bilibili.com/opus/560508706903943321)分别介绍两种功能；后者发布时列出的上限是 4K60。平台是否给某稿提供同一条 8K 杜比视界播放流，要在转码完成后检查实际播放流的尺寸和杜比元数据。
 
 一个投稿 MP4 可包含立体声和真实 E-AC-3 JOC / Atmos 两条音轨。有对应双轨时优先保留；只有合规 Atmos 时，还可制作独立的 24-bit 立体声降混母版。从普通素材新编码 Atmos 需要部署方准备授权 DEE 与匹配的配置文件（`DOLBY_DEE_PATH`、`DOLBY_DEE_PROFILE`）。编码条件不满足时，界面说明本次实际可交付的格式并继续导出。B 站的播放档位由投稿转码结果确定。命令行的同等入口是 `python cli.py --bili-one-click -i "原视频.mp4"`。
 
